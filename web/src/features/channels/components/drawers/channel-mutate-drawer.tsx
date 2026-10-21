@@ -3792,12 +3792,12 @@ export function ChannelMutateDrawer({
                       {formValues.is_enterprise_account
                         ? t('Enterprise accounts use local pricing.')
                         : t(
-                            'Bill wallet-funded text requests using the returned OpenRouter cost and the existing group multiplier. Subscription-funded requests are not supported. Missing costs remain pending; provider-direct BYOK charges are excluded.'
+                            'For standard text requests, billing uses the final OpenRouter USD cost multiplied by the effective group multiplier. Funding follows your billing preference; subscription charges stay within their original billing period. Missing costs stay pending; provider-direct BYOK charges are excluded.'
                           )}
                       {field.value && !formValues.is_enterprise_account && (
                         <span className='mt-1 block'>
                           {t(
-                            'No balance is reserved before the request. The final charge may make the balance negative.'
+                            'No balance or subscription allowance is reserved upfront. The final charge may exceed the available amount; an exhausted funding source cannot pay for further requests until topped up or reset.'
                           )}
                         </span>
                       )}

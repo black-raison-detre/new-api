@@ -47,7 +47,7 @@ format; retain new-api's authorization, validation, billing, and logging control
   their matching OpenRouter endpoints. Native Messages is opt-in for both
   existing and new channels; enterprise channels retain the legacy path.
 - [x] Keep Gemini conversion until native upstream support is verified.
-- [x] Add opt-in OpenRouter returned-cost billing for wallet-funded text
+- [x] Add opt-in OpenRouter returned-cost billing for wallet- and subscription-funded text
   requests before implementing configurable provider routing. Apply the existing
   effective group multiplier and retain existing currency display conversion.
 - [ ] Preserve documented OpenRouter routing fields without requiring blanket
@@ -300,6 +300,74 @@ format; retain new-api's authorization, validation, billing, and logging control
   `/private/tmp/new-api-openrouter-cost-precommit-regression-before.log`,
   `/private/tmp/new-api-openrouter-cost-precommit-fixed-tests.log`, and
   `/private/tmp/new-api-openrouter-cost-precommit-full-go.log`.
+
+### Subscription-funded returned-cost billing (2026-10-21)
+
+- Returned-cost billing now supports subscription allowances as well as wallets.
+  It follows `subscription_only`, `subscription_first`, `wallet_only`, and
+  `wallet_first`; subscription-first wallet fallback retains the existing
+  `allow_wallet_overflow` policy. Unlimited plans and automatic resets are
+  handled before admission. A subscription-funded request needs no wallet credit.
+- Neither funding source reserves quota upfront. The final reported cost uses
+  the frozen effective group multiplier and can exceed the remaining allowance.
+  An exhausted subscription cannot fund another request until reset; a permitted
+  fallback may instead select the wallet for a subsequent request. An incurred
+  subscription charge is never silently moved to a wallet or another subscription.
+- The ledger freezes the funding source, subscription, plan, and allowance cycle
+  before forwarding. Settlement and recovery atomically apply one charge and
+  project the subscription details into logs. Expiry, cancellation, or deletion
+  does not redirect the charge. A late result from an older cycle stays in the
+  ledger/log without consuming the refreshed allowance.
+- Durable cycle versions distinguish even same-second administrative resets.
+  Ordinary-request refunds can reduce postpaid overage, and a reservation from an
+  old cycle cannot refund quota into a new one. Admission, settlement, cancellation,
+  deletion, and expiration use consistent user-before-subscription row locking.
+- Six returned-cost database matrices passed without skips on SQLite 3.50.4,
+  MySQL 8.0.46, and PostgreSQL 15.19, including funding preferences, concurrent
+  admission/settlement, overage, reset/expiry/deletion, recovery, and mixed refunds.
+- Full startup checks passed twice on fresh and released `v1.0.0-rc.45` databases
+  for all three engines (12 current starts). Existing balances, subscription
+  reservations, and all released indexes were retained, with no index drift on
+  the second start. An additional upgrade from wallet-billing commit `6ec432838`
+  passed twice per engine and preserved pending wallet ledgers with zero-valued
+  subscription snapshots (six more current starts).
+- Real ClickHouse 25.8.33.6 logging passed pending-to-settled projection with one
+  subscription charge, one consume log, and an unchanged wallet. An authenticated
+  production-router check against a TLS mock upstream charged USD 0.002 times
+  group multiplier 2 as 2,000 subscription quota with an empty wallet, then rejected
+  the next request before forwarding. This was not a live OpenRouter call.
+- Independent backend review approved the final source after the concurrency
+  fixes. The strict root suite encountered the already documented
+  `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` baseline failure;
+  the final root suite passed with only that case excluded. Other unrelated
+  environment-dependent test skips remain; the six OpenRouter matrices had none.
+- Frontend validation passed 148 tests across four existing channel/usage-log
+  files, typecheck, targeted lint, i18n sync, and the production build. Inspected
+  desktop and phone screenshots and exercised keyboard selection and enterprise
+  disabling with mocked management APIs. The channel explanation is translated
+  in all seven locales and reuses the existing setting components.
+- Reproduction commands (root unless noted; the wrappers load isolated test DSNs):
+
+  ```sh
+  python3 /private/tmp/new-api-subcost-run-full-tests.py
+  # Executes with GOCACHE=/private/tmp/new-api-openrouter-gocache:
+  go test -v -p 2 ./... -count=1 -timeout=3m -skip '^TestAdaptorMasksDialedHostsInDialFailure$/^channel_proxy_host$'
+  python3 /private/tmp/new-api-subcost-run-migrations.py
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go build -p 2 -o /private/tmp/new-api-subcost-gateway /private/tmp/new-api-subcost-gateway.go
+  /private/tmp/new-api-subcost-gateway
+  # Inside web/:
+  bun run test src/features/channels/lib/__tests__/openrouter-channel.test.ts src/features/channels/components/__tests__/channel-configuration.test.tsx
+  bun run test src/features/usage-logs/components/__tests__/cost-display.test.tsx src/features/usage-logs/components/__tests__/detail-preview.test.tsx
+  bun run typecheck
+  bunx oxlint -c .oxlintrc.json src/features/channels/components/drawers/channel-mutate-drawer.tsx
+  bun run i18n:sync
+  bun run build
+  ```
+
+- Evidence is under `/private/tmp/new-api-subcost-*`, including
+  `full-go-excluding-baseline.log`, the earlier strict `full-go.log`, per-engine
+  `migration-*` and `wallet-current*` logs, `clickhouse.log`, `gateway.log`,
+  `log-ui-tests.log`, `browser.log`, and desktop/phone screenshots.
 
 ## Phase 2: Catalog and provider metadata
 

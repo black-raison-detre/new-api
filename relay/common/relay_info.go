@@ -345,8 +345,11 @@ type RelayInfo struct {
 	// OpenRouterCostBilling is selected once for the request and remains locked
 	// across channel retries. Its cost and final group snapshot are settled from
 	// OpenRouter's reported USD cost instead of local model prices.
-	OpenRouterCostBilling    bool
-	OpenRouterCostGroupRatio float64
+	OpenRouterCostBilling                   bool
+	OpenRouterCostGroupRatio                float64
+	OpenRouterCostSubscriptionLastResetTime int64
+	OpenRouterCostSubscriptionNextResetTime int64
+	OpenRouterCostSubscriptionCycleVersion  int64
 	// OpenRouterGenerationID is captured from OpenRouter's X-Generation-Id
 	// response header. It is per-attempt and is never populated from body IDs.
 	OpenRouterGenerationID string

@@ -27,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 const (
@@ -44,43 +45,45 @@ func openRouterCostMessage(c *gin.Context, key string) string {
 	return i18n.T(c, key)
 }
 
-// PrepareOpenRouterCostBilling admits a cost-billed request without a wallet
-// reservation. Subscription-only requests are rejected before forwarding.
+// PrepareOpenRouterCostBilling selects a durable funding source without an
+// upfront reservation; the reported OpenRouter cost is charged after response.
 func PrepareOpenRouterCostBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	if c == nil || c.Request == nil || info == nil || !info.OpenRouterCostBilling {
 		return types.NewError(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostNotSelected)), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
-	pref := common.NormalizeBillingPreference(info.UserSetting.BillingPreference)
-	switch pref {
-	case "wallet_only", "wallet_first":
-	case "subscription_only":
-		return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostSubscription)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
-	case "subscription_first":
-		hasSubscription, err := model.HasActiveUserSubscription(info.UserId)
+	var funding *model.OpenRouterCostFundingSelection
+	ledger, ledgerErr := model.GetOpenRouterCostLedger(info.RequestId)
+	if ledgerErr == nil {
+		if ledger.UserId != info.UserId || ledger.TokenId != info.TokenId || ledger.IsPlayground != info.IsPlayground {
+			return types.NewError(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostNotSelected)), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+		}
+		funding = openRouterCostFundingFromLedger(ledger)
+	} else if errors.Is(ledgerErr, gorm.ErrRecordNotFound) {
+		var err error
+		funding, err = model.SelectOpenRouterCostFunding(info.UserId, common.NormalizeBillingPreference(info.UserSetting.BillingPreference))
 		if err != nil {
-			logger.LogError(c, common.LogText("OpenRouter billing subscription lookup failed: %s", err.Error()))
-			return types.NewError(errors.New(openRouterCostMessage(c, i18n.MsgDatabaseError)), types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+			switch {
+			case errors.Is(err, model.ErrOpenRouterCostWalletUnavailable):
+				return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostWalletPositive)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			case errors.Is(err, model.ErrOpenRouterCostWalletInvalid):
+				logger.LogWarn(c, common.LogText("OpenRouter billing admission rejected an invalid wallet balance: %s", err.Error()))
+				return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostWalletInvalid)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			case errors.Is(err, model.ErrOpenRouterCostSubscriptionUnavailable):
+				message := i18n.T(c, i18n.MsgQuotaSubscriptionInsufficient, map[string]any{"Error": err.Error()})
+				return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			default:
+				logger.LogError(c, common.LogText("OpenRouter billing funding lookup failed: %s", err.Error()))
+				return types.NewError(errors.New(openRouterCostMessage(c, i18n.MsgDatabaseError)), types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+			}
 		}
-		if hasSubscription {
-			return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostActiveSub)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
-		}
-	default:
-		return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostWalletPref)), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-	}
-
-	userQuota, err := model.GetUserQuota(info.UserId, true)
-	if err != nil {
-		logger.LogError(c, common.LogText("OpenRouter billing wallet lookup failed: %s", err.Error()))
+	} else {
+		logger.LogError(c, common.LogText("OpenRouter billing ledger lookup failed: %s", ledgerErr.Error()))
 		return types.NewError(errors.New(openRouterCostMessage(c, i18n.MsgDatabaseError)), types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
 	}
-	if userQuota <= 0 {
-		return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostWalletPositive)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+	if funding == nil || (funding.BillingSource != BillingSourceWallet && funding.BillingSource != BillingSourceSubscription) {
+		return types.NewError(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostNotSelected)), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
-	if err := common.ValidateWalletQuota(userQuota); err != nil {
-		logger.LogWarn(c, common.LogText("OpenRouter billing admission rejected an invalid wallet balance: %s", err.Error()))
-		return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostWalletInvalid)), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
-	}
-	info.UserQuota = userQuota
+	applyOpenRouterCostFunding(info, funding)
 	if !info.IsPlayground && !info.TokenUnlimited && info.TokenId > 0 {
 		token, tokenErr := model.GetTokenByIds(info.TokenId, info.UserId)
 		if tokenErr != nil {
@@ -92,10 +95,49 @@ func PrepareOpenRouterCostBilling(c *gin.Context, info *relaycommon.RelayInfo) *
 		}
 	}
 
-	info.BillingSource = BillingSourceWallet
+	return nil
+}
+
+func openRouterCostFundingFromLedger(ledger *model.OpenRouterCostLedger) *model.OpenRouterCostFundingSelection {
+	if ledger == nil {
+		return nil
+	}
+	source := ledger.BillingSource
+	if source == "" {
+		source = BillingSourceWallet
+	}
+	return &model.OpenRouterCostFundingSelection{
+		BillingSource:                     source,
+		SubscriptionId:                    ledger.SubscriptionId,
+		SubscriptionPlanId:                ledger.SubscriptionPlanId,
+		SubscriptionPlanTitle:             ledger.SubscriptionPlanTitle,
+		SubscriptionAmountTotal:           ledger.SubscriptionAmountTotal,
+		SubscriptionAmountUsedAtAdmission: ledger.SubscriptionAmountUsedAtAdmission,
+		SubscriptionLastResetTime:         ledger.SubscriptionLastResetTime,
+		SubscriptionNextResetTime:         ledger.SubscriptionNextResetTime,
+		SubscriptionQuotaCycleVersion:     ledger.SubscriptionQuotaCycleVersion,
+	}
+}
+
+func applyOpenRouterCostFunding(info *relaycommon.RelayInfo, funding *model.OpenRouterCostFundingSelection) {
+	info.BillingSource = funding.BillingSource
+	if funding.BillingSource == BillingSourceSubscription {
+		info.UserQuota = 0
+	} else if funding.UserQuota > 0 {
+		info.UserQuota = funding.UserQuota
+	}
 	info.FinalPreConsumedQuota = 0
 	info.Billing = nil
-	return nil
+	info.SubscriptionPreConsumed = 0
+	info.SubscriptionPostDelta = 0
+	info.SubscriptionId = funding.SubscriptionId
+	info.SubscriptionPlanId = funding.SubscriptionPlanId
+	info.SubscriptionPlanTitle = funding.SubscriptionPlanTitle
+	info.SubscriptionAmountTotal = funding.SubscriptionAmountTotal
+	info.SubscriptionAmountUsedAfterPreConsume = funding.SubscriptionAmountUsedAtAdmission
+	info.OpenRouterCostSubscriptionLastResetTime = funding.SubscriptionLastResetTime
+	info.OpenRouterCostSubscriptionNextResetTime = funding.SubscriptionNextResetTime
+	info.OpenRouterCostSubscriptionCycleVersion = funding.SubscriptionQuotaCycleVersion
 }
 
 func PrepareOpenRouterCostForSelectedGroup(c *gin.Context, info *relaycommon.RelayInfo) error {
@@ -115,6 +157,11 @@ func PrepareOpenRouterCostForSelectedGroup(c *gin.Context, info *relaycommon.Rel
 	if err := model.EnsureOpenRouterCostLedger(ledgerInput); err != nil {
 		return err
 	}
+	ledger, err := model.GetOpenRouterCostLedger(info.RequestId)
+	if err != nil {
+		return err
+	}
+	applyOpenRouterCostFunding(info, openRouterCostFundingFromLedger(ledger))
 	requestId := info.RequestId
 	info.OpenRouterGenerationRecorder = func(generationId string) error {
 		return model.RecordOpenRouterGenerationID(requestId, generationId)
@@ -209,23 +256,31 @@ func openRouterCostLedgerInput(c *gin.Context, info *relaycommon.RelayInfo, chan
 		return model.OpenRouterCostLedgerInput{}, errors.New("OpenRouter request id is unavailable")
 	}
 	return model.OpenRouterCostLedgerInput{
-		RequestId:             info.RequestId,
-		GenerationEndpoint:    endpoint,
-		EndpointFingerprint:   endpointFingerprint,
-		ChannelKeyFingerprint: keyFingerprint,
-		ChannelKeyIndex:       channelMeta.ChannelMultiKeyIndex,
-		ChannelId:             channelMeta.ChannelId,
-		ModelName:             info.GetBillingModelName(),
-		UserId:                info.UserId,
-		Username:              c.GetString("username"),
-		TokenId:               info.TokenId,
-		IsPlayground:          info.IsPlayground,
-		BillingSource:         BillingSourceWallet,
-		Group:                 info.UsingGroup,
-		NodeName:              common.NodeName,
-		GroupRatio:            decimal.NewFromFloat(ratio).String(),
-		IsStream:              info.IsStream,
-		QuotaPerUnit:          int64(common.QuotaPerUnit),
+		RequestId:                         info.RequestId,
+		GenerationEndpoint:                endpoint,
+		EndpointFingerprint:               endpointFingerprint,
+		ChannelKeyFingerprint:             keyFingerprint,
+		ChannelKeyIndex:                   channelMeta.ChannelMultiKeyIndex,
+		ChannelId:                         channelMeta.ChannelId,
+		ModelName:                         info.GetBillingModelName(),
+		UserId:                            info.UserId,
+		Username:                          c.GetString("username"),
+		TokenId:                           info.TokenId,
+		IsPlayground:                      info.IsPlayground,
+		BillingSource:                     info.BillingSource,
+		SubscriptionId:                    info.SubscriptionId,
+		SubscriptionPlanId:                info.SubscriptionPlanId,
+		SubscriptionPlanTitle:             info.SubscriptionPlanTitle,
+		SubscriptionAmountTotal:           info.SubscriptionAmountTotal,
+		SubscriptionAmountUsedAtAdmission: info.SubscriptionAmountUsedAfterPreConsume,
+		SubscriptionLastResetTime:         info.OpenRouterCostSubscriptionLastResetTime,
+		SubscriptionNextResetTime:         info.OpenRouterCostSubscriptionNextResetTime,
+		SubscriptionQuotaCycleVersion:     info.OpenRouterCostSubscriptionCycleVersion,
+		Group:                             info.UsingGroup,
+		NodeName:                          common.NodeName,
+		GroupRatio:                        decimal.NewFromFloat(ratio).String(),
+		IsStream:                          info.IsStream,
+		QuotaPerUnit:                      int64(common.QuotaPerUnit),
 	}, nil
 }
 
@@ -358,6 +413,16 @@ func settleSavedOpenRouterCost(info *relaycommon.RelayInfo, ledger *model.OpenRo
 	applied, err := model.SettleOpenRouterCostLedger(ledger.RequestId, ledger.UpstreamCostUSD, quota, clamp)
 	if err != nil {
 		return 0, clamp, false, err
+	}
+	if info != nil {
+		settledLedger, err := model.GetOpenRouterCostLedger(ledger.RequestId)
+		if err != nil {
+			return 0, clamp, applied, err
+		}
+		applyOpenRouterCostFunding(info, openRouterCostFundingFromLedger(settledLedger))
+		if settledLedger.Status == model.OpenRouterCostStatusSettled && settledLedger.BillingSource == BillingSourceSubscription {
+			info.SubscriptionPostDelta = settledLedger.Quota
+		}
 	}
 	if applied && clamp != nil {
 		if info != nil {

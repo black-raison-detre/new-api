@@ -77,7 +77,7 @@ func openRouterCostDatabase(t *testing.T, dialect string, options ...openRouterC
 	if dialect == "sqlite" && (!opts.deferredSQLite) {
 		sqlDB.SetMaxOpenConns(1)
 	}
-	models := []any{&model.OpenRouterCostLedger{}, &model.QuotaData{}, &model.Log{}, &model.Token{}, &model.Channel{}, &model.UserSubscription{}, &model.User{}}
+	models := []any{&model.OpenRouterCostLedger{}, &model.QuotaData{}, &model.Log{}, &model.Token{}, &model.Channel{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}, &model.User{}}
 	require.NoError(t, db.Migrator().DropTable(models...))
 	for range 2 {
 		require.NoError(t, db.AutoMigrate(models...))
@@ -87,6 +87,7 @@ func openRouterCostDatabase(t *testing.T, dialect string, options ...openRouterC
 	originalRedis, originalBatch, originalLogging := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
 	originalExport := common.DataExportEnabled
 	model.DB, model.LOG_DB = db, db
+	model.InvalidateSubscriptionPlanCache(1)
 	common.SetDatabaseTypes(dbType, dbType)
 	common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
 	common.DataExportEnabled = true
@@ -94,6 +95,7 @@ func openRouterCostDatabase(t *testing.T, dialect string, options ...openRouterC
 		assert.NoError(t, db.Migrator().DropTable(models...))
 		assert.NoError(t, sqlDB.Close())
 		model.DB, model.LOG_DB = originalDB, originalLog
+		model.InvalidateSubscriptionPlanCache(1)
 		common.SetDatabaseTypes(originalMainType, originalLogType)
 		common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = originalRedis, originalBatch, originalLogging
 		common.DataExportEnabled = originalExport
@@ -120,6 +122,45 @@ func openRouterCostDatabase(t *testing.T, dialect string, options ...openRouterC
 	}
 	t.Cleanup(func() { stopOpenRouterCostHeartbeat(info) })
 	return c, info
+}
+
+func seedOpenRouterCostSubscription(t *testing.T, id, planId int, amountTotal, amountUsed int64, allowWalletOverflow bool, resetPeriod string, nextResetTime int64) (*model.SubscriptionPlan, *model.UserSubscription) {
+	t.Helper()
+	plan := &model.SubscriptionPlan{
+		Id:                      planId,
+		Title:                   "OpenRouter cost plan",
+		Enabled:                 true,
+		TotalAmount:             amountTotal,
+		QuotaResetPeriod:        resetPeriod,
+		QuotaResetCustomSeconds: 86400,
+	}
+	require.NoError(t, model.DB.Create(plan).Error)
+	model.InvalidateSubscriptionPlanCache(planId)
+	sub := &model.UserSubscription{
+		Id:                  id,
+		UserId:              1,
+		PlanId:              planId,
+		AmountTotal:         amountTotal,
+		AmountUsed:          amountUsed,
+		StartTime:           time.Now().Add(-time.Hour).Unix(),
+		EndTime:             time.Now().Add(time.Hour).Unix(),
+		Status:              "active",
+		AllowWalletOverflow: allowWalletOverflow,
+		LastResetTime:       time.Now().Add(-time.Hour).Unix(),
+		NextResetTime:       nextResetTime,
+	}
+	require.NoError(t, model.DB.Create(sub).Error)
+	return plan, sub
+}
+
+func setOpenRouterCostSubscriptionDowngrade(t *testing.T, subId int, fromGroup, toGroup string) {
+	t.Helper()
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 1).Update("group", fromGroup).Error)
+	require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", subId).Updates(map[string]any{
+		"upgrade_group":   fromGroup,
+		"prev_user_group": toGroup,
+		"downgrade_group": toGroup,
+	}).Error)
 }
 
 func TestOpenRouterCostProjectionWithDeferredSQLiteAndSeparateLogDB(t *testing.T) {
@@ -167,6 +208,429 @@ func prepareOpenRouterCostRequest(t *testing.T, c *gin.Context, info *relaycommo
 	require.Nil(t, PrepareTieredBillingForSelectedGroup(c, info))
 }
 
+func prepareOpenRouterCostSubscriptionRequest(t *testing.T, c *gin.Context, info *relaycommon.RelayInfo, requestId string) {
+	t.Helper()
+	info.RequestId = requestId
+	info.UserSetting.BillingPreference = "subscription_only"
+	info.OpenRouterGenerationID = ""
+	info.OpenRouterCostFinal = false
+	info.OpenRouterGenerationRecorder = nil
+	info.BillingSource = ""
+	info.SubscriptionId = 0
+	info.SubscriptionPlanId = 0
+	info.SubscriptionPlanTitle = ""
+	info.SubscriptionAmountTotal = 0
+	info.SubscriptionAmountUsedAfterPreConsume = 0
+	info.OpenRouterCostSubscriptionLastResetTime = 0
+	info.OpenRouterCostSubscriptionNextResetTime = 0
+	info.OpenRouterCostSubscriptionCycleVersion = 0
+	prepareOpenRouterCostRequest(t, c, info)
+	stopOpenRouterCostHeartbeat(info)
+}
+
+func TestOpenRouterCostFundingPreferenceDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			_, _ = openRouterCostDatabase(t, dialect)
+			plan, sub := seedOpenRouterCostSubscription(t, 1, 1, 1000, 0, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 1).Update("quota", 0).Error)
+
+			selected, err := model.SelectOpenRouterCostFunding(1, "subscription_only")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource, "subscription-only must work without wallet balance")
+			assert.Equal(t, sub.Id, selected.SubscriptionId)
+
+			selected, err = model.SelectOpenRouterCostFunding(1, "subscription_first")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource)
+
+			selected, err = model.SelectOpenRouterCostFunding(1, "wallet_first")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource, "wallet-first falls back only after wallet is not spendable")
+
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 1).Update("quota", 1000).Error)
+			selected, err = model.SelectOpenRouterCostFunding(1, "wallet_first")
+			require.NoError(t, err)
+			assert.Equal(t, "wallet", selected.BillingSource, "wallet-first prefers spendable wallet quota")
+			selected, err = model.SelectOpenRouterCostFunding(1, "wallet_only")
+			require.NoError(t, err)
+			assert.Equal(t, "wallet", selected.BillingSource, "wallet-only ignores an available subscription")
+
+			// An empty or unknown preference normalizes to subscription-first.
+			selected, err = model.SelectOpenRouterCostFunding(1, "")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource)
+			selected, err = model.SelectOpenRouterCostFunding(1, "invalid")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource)
+
+			// Exhaustion falls back only when every active subscription permits it.
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", sub.Id).Updates(map[string]any{"amount_used": 1000, "allow_wallet_overflow": true}).Error)
+			selected, err = model.SelectOpenRouterCostFunding(1, "subscription_first")
+			require.NoError(t, err)
+			assert.Equal(t, "wallet", selected.BillingSource)
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", sub.Id).Update("allow_wallet_overflow", false).Error)
+			_, err = model.SelectOpenRouterCostFunding(1, "subscription_first")
+			require.ErrorIs(t, err, model.ErrOpenRouterCostSubscriptionUnavailable, "strict exhausted subscriptions block wallet fallback")
+			_, err = model.SelectOpenRouterCostFunding(1, "subscription_only")
+			require.ErrorIs(t, err, model.ErrOpenRouterCostSubscriptionUnavailable)
+
+			// No active subscription permits the usual subscription-first wallet path.
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", sub.Id).Update("status", "expired").Error)
+			selected, err = model.SelectOpenRouterCostFunding(1, "subscription_first")
+			require.NoError(t, err)
+			assert.Equal(t, "wallet", selected.BillingSource)
+
+			// Zero total means unlimited, even when AmountUsed is nonzero.
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", sub.Id).Updates(map[string]any{"status": "active", "amount_total": 0, "amount_used": 9000}).Error)
+			selected, err = model.SelectOpenRouterCostFunding(1, "subscription_only")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource)
+			assert.Zero(t, selected.SubscriptionAmountTotal)
+
+			// A due automatic reset occurs before allowance selection and advances
+			// the durable cycle marker.
+			require.NoError(t, model.DB.Model(&plan).Updates(map[string]any{"quota_reset_period": model.SubscriptionResetDaily}).Error)
+			model.InvalidateSubscriptionPlanCache(plan.Id)
+			now := model.GetDBTimestamp()
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", sub.Id).Updates(map[string]any{
+				"amount_total":    1000,
+				"amount_used":     1000,
+				"last_reset_time": now - 48*3600,
+				"next_reset_time": now - 24*3600,
+			}).Error)
+			selected, err = model.SelectOpenRouterCostFunding(1, "subscription_only")
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", selected.BillingSource)
+			assert.Zero(t, selected.SubscriptionAmountUsedAtAdmission)
+			assert.Greater(t, selected.SubscriptionQuotaCycleVersion, int64(0))
+		})
+	}
+}
+
+func TestOpenRouterCostConcurrentAdmissionDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			c, info := openRouterCostDatabase(t, dialect)
+			_, _ = seedOpenRouterCostSubscription(t, 1, 1, 10000, 0, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", info.UserId).Update("quota", 0).Error)
+			info.RequestId = "cost-concurrent-admission"
+			info.UserSetting.BillingPreference = "subscription_only"
+			first, second := *info, *info
+			t.Cleanup(func() {
+				stopOpenRouterCostHeartbeat(&first)
+				stopOpenRouterCostHeartbeat(&second)
+			})
+			start := make(chan struct{})
+			results := make(chan error, 2)
+			var workers sync.WaitGroup
+			for _, attempt := range []*relaycommon.RelayInfo{&first, &second} {
+				workers.Go(func() {
+					<-start
+					if apiErr := PrepareOpenRouterCostBilling(c, attempt); apiErr != nil {
+						results <- apiErr
+						return
+					}
+					if apiErr := PrepareTieredBillingForSelectedGroup(c, attempt); apiErr != nil {
+						results <- apiErr
+						return
+					}
+					results <- nil
+				})
+			}
+			close(start)
+			workers.Wait()
+			close(results)
+			for err := range results {
+				require.NoError(t, err)
+			}
+			var ledgers []model.OpenRouterCostLedger
+			require.NoError(t, model.DB.Where("request_id = ?", info.RequestId).Find(&ledgers).Error)
+			require.Len(t, ledgers, 1)
+			assert.Equal(t, "subscription", ledgers[0].BillingSource)
+			assert.Equal(t, 1, ledgers[0].SubscriptionId)
+			var user model.User
+			require.NoError(t, model.DB.First(&user, info.UserId).Error)
+			assert.Zero(t, user.Quota, "duplicate admission must not require or reserve wallet quota")
+		})
+	}
+}
+
+func TestOpenRouterCostSubscriptionSettlementDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			c, info := openRouterCostDatabase(t, dialect)
+			_, sub := seedOpenRouterCostSubscription(t, 1, 1, 1000, 500, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", info.UserId).Update("quota", 0).Error)
+			info.UserSetting.BillingPreference = "subscription_only"
+			prepareOpenRouterCostRequest(t, c, info)
+			stopOpenRouterCostHeartbeat(info)
+
+			ledger, err := model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, "subscription", ledger.BillingSource)
+			assert.Equal(t, sub.Id, ledger.SubscriptionId)
+			assert.Equal(t, sub.PlanId, ledger.SubscriptionPlanId)
+			assert.Equal(t, int64(1000), ledger.SubscriptionAmountTotal)
+			assert.Equal(t, int64(500), ledger.SubscriptionAmountUsedAtAdmission)
+			var user model.User
+			require.NoError(t, model.DB.First(&user, info.UserId).Error)
+			assert.Zero(t, user.Quota, "subscription admission must not require or reserve wallet quota")
+			var token model.Token
+			require.NoError(t, model.DB.First(&token, info.TokenId).Error)
+			assert.Equal(t, 1000, token.RemainQuota, "admission does not reserve token quota")
+
+			// A retry restores the source and instance snapshot from the ledger even
+			// after the billing preference changes.
+			info.UserSetting.BillingPreference = "wallet_only"
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", info.UserId).Update("quota", 5000).Error)
+			require.Nil(t, PrepareOpenRouterCostBilling(c, info))
+			assert.Equal(t, "subscription", info.BillingSource)
+			assert.Equal(t, sub.Id, info.SubscriptionId)
+
+			input, err := openRouterCostLedgerInput(c, info, info.ChannelMeta)
+			require.NoError(t, err)
+			input.SubscriptionId++
+			require.ErrorIs(t, model.EnsureOpenRouterCostLedger(input), model.ErrOpenRouterCostLedgerIdentityChanged)
+
+			require.NoError(t, model.UpdateOpenRouterCostLedgerResult(info.RequestId, "gen-sub-cost", "0.002", model.OpenRouterCostStatusPending, ""))
+			type result struct {
+				charged bool
+				err     error
+			}
+			results := make(chan result, 2)
+			var workers sync.WaitGroup
+			for range 2 {
+				workers.Go(func() {
+					charged, err := model.SettleOpenRouterCostLedger(info.RequestId, "0.002", 2000, nil)
+					results <- result{charged, err}
+				})
+			}
+			workers.Wait()
+			close(results)
+			charges := 0
+			for result := range results {
+				require.NoError(t, result.err)
+				if result.charged {
+					charges++
+				}
+			}
+			assert.Equal(t, 1, charges, "concurrent reconciliation applies one subscription charge")
+			var settledSub model.UserSubscription
+			require.NoError(t, model.DB.First(&settledSub, sub.Id).Error)
+			assert.EqualValues(t, 2500, settledSub.AmountUsed, "postpaid overage is fully charged to the original subscription")
+			var settledUser model.User
+			require.NoError(t, model.DB.First(&settledUser, info.UserId).Error)
+			assert.Equal(t, 5000, settledUser.Quota, "subscription overage never debits wallet quota")
+			assert.Equal(t, 2000, settledUser.UsedQuota)
+			assert.Equal(t, 1, settledUser.RequestCount)
+			var settledToken model.Token
+			require.NoError(t, model.DB.First(&settledToken, info.TokenId).Error)
+			assert.Equal(t, -1000, settledToken.RemainQuota)
+			assert.Equal(t, 2000, settledToken.UsedQuota)
+			ledger, err = model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, int64(2000), ledger.Quota)
+			assert.True(t, ledger.SubscriptionCycleApplied)
+			assert.Equal(t, int64(2500), ledger.SubscriptionAmountUsedAfter)
+
+			require.NoError(t, model.SyncOpenRouterCostConsumeLog(context.Background(), info.RequestId, true))
+			var logs []model.Log
+			require.NoError(t, model.LOG_DB.Where("request_id = ? AND type = ?", info.RequestId, model.LogTypeConsume).Find(&logs).Error)
+			require.Len(t, logs, 1)
+			var other map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+			assert.Equal(t, "subscription", other["billing_source"])
+			assert.EqualValues(t, sub.Id, other["subscription_id"])
+			assert.EqualValues(t, sub.PlanId, other["subscription_plan_id"])
+			assert.EqualValues(t, 2000, other["subscription_consumed"])
+			assert.EqualValues(t, 0, other["wallet_quota_deducted"])
+
+			// Strict exhausted subscriptions keep blocking wallet fallback after
+			// an admitted request settles above the plan allowance.
+			info.RequestId = "cost-after-sub-overage"
+			info.UserSetting.BillingPreference = "subscription_first"
+			assert.NotNil(t, PrepareOpenRouterCostBilling(c, info))
+			var ledgerCount int64
+			require.NoError(t, model.DB.Model(&model.OpenRouterCostLedger{}).Count(&ledgerCount).Error)
+			assert.EqualValues(t, 1, ledgerCount)
+		})
+	}
+}
+
+func TestOpenRouterCostSubscriptionCycleAndLifecycleDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			c, info := openRouterCostDatabase(t, dialect)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", info.UserId).Update("quota", 0).Error)
+
+			// A reset between admission and settlement advances the cycle marker;
+			// the old request remains billed but cannot use the refreshed quota.
+			resetAt := model.GetDBTimestamp()
+			_, resetSub := seedOpenRouterCostSubscription(t, 1, 1, 5000, 100, false, model.SubscriptionResetDaily, resetAt+3600)
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", resetSub.Id).Update("last_reset_time", resetAt-48*3600).Error)
+			prepareOpenRouterCostSubscriptionRequest(t, c, info, "cost-reset-crossing")
+			resetLedger, err := model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.Zero(t, resetLedger.SubscriptionQuotaCycleVersion)
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", resetSub.Id).Update("next_reset_time", resetAt-1).Error)
+			require.NoError(t, model.UpdateOpenRouterCostLedgerResult(info.RequestId, "gen-reset-crossing", "0.002", model.OpenRouterCostStatusPending, ""))
+			charged, err := model.SettleOpenRouterCostLedger(info.RequestId, "0.002", 2000, nil)
+			require.NoError(t, err)
+			assert.True(t, charged)
+			var resetSubAfter model.UserSubscription
+			require.NoError(t, model.DB.First(&resetSubAfter, resetSub.Id).Error)
+			assert.Zero(t, resetSubAfter.AmountUsed, "settlement must not consume the refreshed cycle")
+			assert.Greater(t, resetSubAfter.QuotaCycleVersion, resetLedger.SubscriptionQuotaCycleVersion)
+			resetLedger, err = model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, int64(2000), resetLedger.Quota, "the incurred charge remains in the durable ledger")
+			assert.False(t, resetLedger.SubscriptionCycleApplied)
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", resetSub.Id).Update("status", "expired").Error)
+
+			// Admin invalidation after admission does not cancel an incurred
+			// charge while the selected allowance cycle still exists.
+			_, expiredSub := seedOpenRouterCostSubscription(t, 2, 2, 5000, 100, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", info.TokenId).Update("remain_quota", 10000).Error)
+			prepareOpenRouterCostSubscriptionRequest(t, c, info, "cost-expired-after-admission")
+			setOpenRouterCostSubscriptionDowngrade(t, expiredSub.Id, "premium", "basic")
+			message, err := model.AdminInvalidateUserSubscription(expiredSub.Id)
+			require.NoError(t, err)
+			assert.NotNil(t, message)
+			var downgradedUser model.User
+			require.NoError(t, model.DB.First(&downgradedUser, info.UserId).Error)
+			assert.Equal(t, "basic", downgradedUser.Group)
+			require.NoError(t, model.UpdateOpenRouterCostLedgerResult(info.RequestId, "gen-expired-after-admission", "0.002", model.OpenRouterCostStatusPending, ""))
+			charged, err = model.SettleOpenRouterCostLedger(info.RequestId, "0.002", 2000, nil)
+			require.NoError(t, err)
+			assert.True(t, charged)
+			var expiredSubAfter model.UserSubscription
+			require.NoError(t, model.DB.First(&expiredSubAfter, expiredSub.Id).Error)
+			assert.Equal(t, "cancelled", expiredSubAfter.Status)
+			assert.EqualValues(t, 2100, expiredSubAfter.AmountUsed)
+
+			// Deletion preserves the charge in ledger, logs and counters without
+			// redirecting it to the wallet or another subscription.
+			_, deletedSub := seedOpenRouterCostSubscription(t, 3, 3, 5000, 100, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", info.TokenId).Update("remain_quota", 10000).Error)
+			prepareOpenRouterCostSubscriptionRequest(t, c, info, "cost-deleted-subscription")
+			setOpenRouterCostSubscriptionDowngrade(t, deletedSub.Id, "premium", "basic")
+			message, err = model.AdminDeleteUserSubscription(deletedSub.Id)
+			require.NoError(t, err)
+			assert.NotNil(t, message)
+			var missingSub model.UserSubscription
+			require.ErrorIs(t, model.DB.First(&missingSub, deletedSub.Id).Error, gorm.ErrRecordNotFound)
+			require.NoError(t, model.DB.First(&downgradedUser, info.UserId).Error)
+			assert.Equal(t, "basic", downgradedUser.Group)
+			require.NoError(t, model.UpdateOpenRouterCostLedgerResult(info.RequestId, "gen-deleted-subscription", "0.002", model.OpenRouterCostStatusPending, ""))
+			charged, err = model.SettleOpenRouterCostLedger(info.RequestId, "0.002", 2000, nil)
+			require.NoError(t, err)
+			assert.True(t, charged)
+			deletedLedger, err := model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, model.OpenRouterCostStatusSettled, deletedLedger.Status)
+			assert.Equal(t, int64(2000), deletedLedger.Quota)
+			assert.Equal(t, "subscription", deletedLedger.BillingSource)
+			var wallet model.User
+			require.NoError(t, model.DB.First(&wallet, info.UserId).Error)
+			assert.Zero(t, wallet.Quota)
+
+			// Administrative resets are versioned even when they occur in the same
+			// Unix second as admission.
+			_, adminResetSub := seedOpenRouterCostSubscription(t, 4, 4, 5000, 100, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", info.TokenId).Update("remain_quota", 10000).Error)
+			prepareOpenRouterCostSubscriptionRequest(t, c, info, "cost-admin-reset-same-second")
+			adminLedger, err := model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			_, err = model.AdminResetUserSubscriptionsByPlan(info.UserId, adminResetSub.PlanId, false)
+			require.NoError(t, err)
+			var adminResetAfter model.UserSubscription
+			require.NoError(t, model.DB.First(&adminResetAfter, adminResetSub.Id).Error)
+			assert.Greater(t, adminResetAfter.QuotaCycleVersion, adminLedger.SubscriptionQuotaCycleVersion)
+			require.NoError(t, model.UpdateOpenRouterCostLedgerResult(info.RequestId, "gen-admin-reset", "0.002", model.OpenRouterCostStatusPending, ""))
+			charged, err = model.SettleOpenRouterCostLedger(info.RequestId, "0.002", 2000, nil)
+			require.NoError(t, err)
+			assert.True(t, charged)
+			require.NoError(t, model.DB.First(&adminResetAfter, adminResetSub.Id).Error)
+			assert.Zero(t, adminResetAfter.AmountUsed)
+			adminLedger, err = model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.False(t, adminLedger.SubscriptionCycleApplied)
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("id = ?", adminResetSub.Id).Update("status", "expired").Error)
+
+			// Recovery after restart reads source and plan identity from the ledger.
+			_, recoverySub := seedOpenRouterCostSubscription(t, 5, 5, 5000, 0, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", info.TokenId).Update("remain_quota", 10000).Error)
+			prepareOpenRouterCostSubscriptionRequest(t, c, info, "cost-subscription-recovery")
+			info.OpenRouterGenerationID = "gen-subscription-recovery"
+			require.NoError(t, info.OpenRouterGenerationRecorder(info.OpenRouterGenerationID))
+			FinalizeOpenRouterCostFailure(info)
+			originalTransport := http.DefaultTransport
+			http.DefaultTransport = openRouterCostTransport(func(req *http.Request) (*http.Response, error) {
+				assert.Equal(t, "gen-subscription-recovery", req.URL.Query().Get("id"))
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":{"id":"gen-subscription-recovery","total_cost":0.002}}`)), Header: make(http.Header)}, nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = originalTransport })
+			for range 3 {
+				reconcileOpenRouterCostLedgers(context.Background())
+			}
+			recoveredLedger, err := model.GetOpenRouterCostLedger(info.RequestId)
+			require.NoError(t, err)
+			assert.Equal(t, model.OpenRouterCostStatusSettled, recoveredLedger.Status)
+			assert.Equal(t, "subscription", recoveredLedger.BillingSource)
+			assert.Equal(t, recoverySub.Id, recoveredLedger.SubscriptionId)
+			var recoveredLogs []model.Log
+			require.NoError(t, model.LOG_DB.Where("request_id = ? AND type = ?", info.RequestId, model.LogTypeConsume).Find(&recoveredLogs).Error)
+			require.Len(t, recoveredLogs, 1)
+			var other map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(recoveredLogs[0].Other, &other))
+			assert.Equal(t, "subscription", other["billing_source"])
+			assert.EqualValues(t, recoverySub.Id, other["subscription_id"])
+			assert.EqualValues(t, recoverySub.PlanId, other["subscription_plan_id"])
+			assert.EqualValues(t, 2000, other["subscription_consumed"])
+		})
+	}
+}
+
+func TestOpenRouterCostSubscriptionRefundAfterOverageAndResetDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			c, info := openRouterCostDatabase(t, dialect)
+			plan, sub := seedOpenRouterCostSubscription(t, 1, 1, 1000, 900, false, model.SubscriptionResetNever, 0)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", info.UserId).Update("quota", 0).Error)
+			prepareOpenRouterCostSubscriptionRequest(t, c, info, "cost-subscription-with-ordinary-refund")
+			reserved, err := model.PreConsumeUserSubscription("ordinary-reserved", info.UserId, "model", 0, 100)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1000, reserved.AmountUsedAfter)
+			require.NoError(t, model.UpdateOpenRouterCostLedgerResult(info.RequestId, "gen-mixed-refund", "0.0002", model.OpenRouterCostStatusPending, ""))
+			charged, err := model.SettleOpenRouterCostLedger(info.RequestId, "0.0002", 200, nil)
+			require.NoError(t, err)
+			assert.True(t, charged)
+			require.NoError(t, model.RefundSubscriptionPreConsume("ordinary-reserved"))
+			var afterRefund model.UserSubscription
+			require.NoError(t, model.DB.First(&afterRefund, sub.Id).Error)
+			assert.EqualValues(t, 1100, afterRefund.AmountUsed, "an ordinary refund must reduce postpaid overage while preserving the actual-cost charge")
+
+			// An old reservation refund after a reset must not reduce usage already
+			// incurred in the new allowance cycle.
+			_, err = model.AdminResetUserSubscriptionsByPlan(info.UserId, plan.Id, false)
+			require.NoError(t, err)
+			oldCycle, err := model.PreConsumeUserSubscription("ordinary-old-cycle", info.UserId, "model", 0, 100)
+			require.NoError(t, err)
+			assert.EqualValues(t, 100, oldCycle.AmountUsedAfter)
+			_, err = model.AdminResetUserSubscriptionsByPlan(info.UserId, plan.Id, false)
+			require.NoError(t, err)
+			newCycle, err := model.PreConsumeUserSubscription("ordinary-new-cycle", info.UserId, "model", 0, 300)
+			require.NoError(t, err)
+			assert.EqualValues(t, 300, newCycle.AmountUsedAfter)
+			require.NoError(t, model.RefundSubscriptionPreConsume("ordinary-old-cycle"))
+			var afterOldRefund model.UserSubscription
+			require.NoError(t, model.DB.First(&afterOldRefund, sub.Id).Error)
+			assert.EqualValues(t, 300, afterOldRefund.AmountUsed)
+		})
+	}
+}
+
 func TestOpenRouterCostBillingDatabaseMatrix(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
@@ -179,6 +643,11 @@ func TestOpenRouterCostBillingDatabaseMatrix(t *testing.T) {
 				var beforeToken model.Token
 				require.NoError(t, model.DB.First(&beforeToken, 1).Error)
 				assert.Equal(t, 1000, beforeToken.RemainQuota, "admission must not reserve token credit")
+				ledger, err := model.GetOpenRouterCostLedger(info.RequestId)
+				require.NoError(t, err)
+				assert.Equal(t, "wallet", ledger.BillingSource)
+				assert.Zero(t, ledger.SubscriptionId, "legacy wallet ledgers keep zero-valued subscription snapshots")
+				assert.Zero(t, ledger.SubscriptionQuotaCycleVersion)
 				info.PriceData.GroupRatioInfo.GroupRatio = 9
 				info.OpenRouterCostFinal = true
 				stopOpenRouterCostHeartbeat(info)
@@ -256,14 +725,10 @@ func TestOpenRouterCostBillingDatabaseMatrix(t *testing.T) {
 				_, err = model.GetTokenByIds(info.TokenId, info.UserId)
 				assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
 			})
-			t.Run("subscription and exhausted token are rejected before forwarding", func(t *testing.T) {
+			t.Run("an exhausted token is rejected even when a subscription can fund the request", func(t *testing.T) {
 				c, info := openRouterCostDatabase(t, dialect)
+				_, _ = seedOpenRouterCostSubscription(t, 1, 1, 1000, 0, true, model.SubscriptionResetNever, 0)
 				info.UserSetting.BillingPreference = "subscription_only"
-				assert.NotNil(t, PrepareOpenRouterCostBilling(c, info))
-				info.UserSetting.BillingPreference = "subscription_first"
-				require.NoError(t, model.DB.Create(&model.UserSubscription{UserId: 1, Status: "active", AmountTotal: 1000, EndTime: time.Now().Add(time.Hour).Unix()}).Error)
-				assert.NotNil(t, PrepareOpenRouterCostBilling(c, info))
-				info.UserSetting.BillingPreference = "wallet_only"
 				require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 1).Update("remain_quota", 0).Error)
 				c.Set("token_quota", 1000)
 				assert.NotNil(t, PrepareOpenRouterCostBilling(c, info), "stale context must not bypass the current token balance")
