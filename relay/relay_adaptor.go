@@ -30,6 +30,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/newapi"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
+	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	"github.com/QuantumNous/new-api/relay/channel/palm"
 	"github.com/QuantumNous/new-api/relay/channel/perplexity"
 	"github.com/QuantumNous/new-api/relay/channel/replicate"
@@ -98,7 +99,7 @@ func GetAdaptor(apiType int) channel.Adaptor {
 	case constant.APITypeBaiduV2:
 		return &baidu_v2.Adaptor{}
 	case constant.APITypeOpenRouter:
-		return &openai.Adaptor{}
+		return &openrouter.Adaptor{}
 	case constant.APITypeXinference:
 		return &openai.Adaptor{}
 	case constant.APITypeXai:

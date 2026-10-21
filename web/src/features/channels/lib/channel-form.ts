@@ -276,6 +276,7 @@ export const channelFormSchema = z
     system_prompt_override: z.boolean().optional(),
     // Type-specific settings (stored in settings JSON)
     is_enterprise_account: z.boolean().optional(), // OpenRouter specific
+    openrouter_native_messages: z.boolean().optional(),
     vertex_key_type: z.enum(['json', 'api_key']).optional(), // Vertex AI specific
     vertex_project_id: z.string().optional(), // Vertex AI specific (api_key mode only)
     aws_key_type: z.enum(['ak_sk', 'api_key']).optional(), // AWS specific
@@ -470,6 +471,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   system_prompt_override: false,
   // Type-specific settings
   is_enterprise_account: false,
+  openrouter_native_messages: false,
   vertex_key_type: 'json',
   vertex_project_id: '',
   aws_key_type: 'ak_sk',
@@ -550,6 +552,7 @@ export function transformChannelToFormDefaults(
   let vertexProjectId = ''
   let azureResponsesVersion = ''
   let isEnterpriseAccount = false
+  let openrouterNativeMessages = false
   let awsKeyType: 'ak_sk' | 'api_key' = 'ak_sk'
   let awsApiType: 'invoke_model' | 'mantle' = 'invoke_model'
   let allowServiceTier = false
@@ -573,6 +576,7 @@ export function transformChannelToFormDefaults(
       vertexProjectId = parsed.vertex_project_id || ''
       azureResponsesVersion = parsed.azure_responses_version || ''
       isEnterpriseAccount = parsed.openrouter_enterprise === true
+      openrouterNativeMessages = parsed.openrouter_native_messages === true
       awsKeyType = parsed.aws_key_type || 'ak_sk'
       awsApiType = parsed.aws_api_type || 'invoke_model'
       allowServiceTier = parsed.allow_service_tier === true
@@ -632,6 +636,7 @@ export function transformChannelToFormDefaults(
     ...extraSettings,
     // Type-specific settings
     is_enterprise_account: isEnterpriseAccount,
+    openrouter_native_messages: openrouterNativeMessages,
     vertex_key_type: vertexKeyType,
     vertex_project_id: vertexProjectId,
     azure_responses_version: azureResponsesVersion,
@@ -739,8 +744,11 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
   // Add enterprise account setting for OpenRouter (type 20)
   if (formData.type === 20) {
     settingsObj.openrouter_enterprise = formData.is_enterprise_account === true
-  } else if ('openrouter_enterprise' in settingsObj) {
+    settingsObj.openrouter_native_messages =
+      formData.openrouter_native_messages === true
+  } else {
     delete settingsObj.openrouter_enterprise
+    delete settingsObj.openrouter_native_messages
   }
 
   // AWS interface selection is opt-in; existing channels retain InvokeModel.

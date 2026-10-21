@@ -19,7 +19,6 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/ai360"
 	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
-	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	//"github.com/QuantumNous/new-api/relay/channel/minimax"
@@ -807,8 +806,6 @@ func (a *Adaptor) GetModelList() []string {
 	//	return minimax.ModelList
 	case constant.ChannelTypeXinference:
 		return xinference.ModelList
-	case constant.ChannelTypeOpenRouter:
-		return openrouter.ModelList
 	default:
 		return ModelList
 	}
@@ -824,8 +821,6 @@ func (a *Adaptor) GetChannelName() string {
 	//	return minimax.ChannelName
 	case constant.ChannelTypeXinference:
 		return xinference.ChannelName
-	case constant.ChannelTypeOpenRouter:
-		return openrouter.ChannelName
 	default:
 		return ChannelName
 	}

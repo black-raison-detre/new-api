@@ -1,6 +1,6 @@
 package openrouter
 
-import "encoding/json"
+import openrouterdto "github.com/QuantumNous/new-api/relay/channel/openrouter/dto"
 
 type RequestReasoning struct {
 	Enabled bool `json:"enabled"`
@@ -11,7 +11,4 @@ type RequestReasoning struct {
 	Exclude bool `json:"exclude,omitempty"` // Set to true to exclude reasoning tokens from response
 }
 
-type OpenRouterEnterpriseResponse struct {
-	Data    json.RawMessage `json:"data"`
-	Success bool            `json:"success"`
-}
+type OpenRouterEnterpriseResponse = openrouterdto.EnterpriseResponse

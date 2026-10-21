@@ -291,6 +291,7 @@ const SENSITIVE_FORM_FIELDS = [
   'setting',
   'advanced_custom',
   'is_enterprise_account',
+  'openrouter_native_messages',
   'vertex_key_type',
   'vertex_project_id',
   'aws_key_type',
@@ -3706,6 +3707,34 @@ export function ChannelMutateDrawer({
                     <FormControl>
                       <Switch
                         disabled={sensitiveLocked}
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            )}
+
+            {currentType === 20 && (
+              <FormField
+                control={form.control}
+                name='openrouter_native_messages'
+                render={({ field }) => (
+                  <FormItem className='flex items-center justify-between gap-4'>
+                    <div className='space-y-0.5'>
+                      <FormLabel>{t('Native Anthropic Messages')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Forward Messages requests to /v1/messages. Off by default; enterprise accounts keep the existing conversion path.'
+                        )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        disabled={
+                          sensitiveLocked || formValues.is_enterprise_account
+                        }
                         checked={field.value}
                         onCheckedChange={field.onChange}
                       />

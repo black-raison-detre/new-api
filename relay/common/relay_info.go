@@ -75,6 +75,18 @@ type ChannelMeta struct {
 	SupportStreamOptions bool // 是否支持流式选项
 }
 
+// UsesOpenRouterNativeMessages keeps existing and enterprise channels on their
+// OpenAI-compatible path unless native Messages is explicitly enabled.
+func (info *RelayInfo) UsesOpenRouterNativeMessages() bool {
+	return info != nil && info.ChannelMeta != nil &&
+		info.ChannelType == constant.ChannelTypeOpenRouter &&
+		info.ChannelOtherSettings.OpenRouterNativeMessages &&
+		!info.ChannelOtherSettings.IsOpenRouterEnterprise() &&
+		info.RelayFormat == types.RelayFormatClaude &&
+		info.RelayMode != relayconstant.RelayModeResponses &&
+		info.RelayMode != relayconstant.RelayModeResponsesCompact
+}
+
 type TokenCountMeta struct {
 	//promptTokens int
 	estimatePromptTokens int

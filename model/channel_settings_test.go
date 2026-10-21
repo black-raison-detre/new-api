@@ -143,6 +143,28 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 				require.NoError(t, db.Raw("select version()").Scan(&version).Error)
 			}
 			t.Logf("%s version: %s", dialect, version)
+			t.Run("openrouter native messages", func(t *testing.T) {
+				channel := &Channel{Type: constant.ChannelTypeOpenRouter, Key: "test", Name: "openrouter", Status: common.ChannelStatusEnabled}
+				channel.SetOtherSettings(dto.ChannelOtherSettings{OpenRouterEnterprise: common.GetPointer(false), AllowServiceTier: true})
+				require.NoError(t, table.Create(channel).Error)
+				var loaded Channel
+				require.NoError(t, table.First(&loaded, channel.Id).Error)
+				assert.False(t, loaded.GetOtherSettings().OpenRouterNativeMessages, "existing records stay on conversion")
+				for _, enabled := range []bool{true, false} {
+					settings := loaded.GetOtherSettings()
+					settings.OpenRouterNativeMessages = enabled
+					loaded.SetOtherSettings(settings)
+					require.NoError(t, table.Save(&loaded).Error)
+					for range 2 {
+						require.NoError(t, table.First(&loaded, channel.Id).Error)
+						settings = loaded.GetOtherSettings()
+						assert.Equal(t, enabled, settings.OpenRouterNativeMessages)
+						require.NotNil(t, settings.OpenRouterEnterprise)
+						assert.False(t, *settings.OpenRouterEnterprise)
+						assert.True(t, settings.AllowServiceTier)
+					}
+				}
+			})
 			for _, channelType := range []int{constant.ChannelTypeVLLM, constant.ChannelTypeSGLang} {
 				t.Run(fmt.Sprint(channelType), func(t *testing.T) {
 					channel := &Channel{Type: channelType, Key: "EMPTY", Name: "inference", Status: common.ChannelStatusEnabled}

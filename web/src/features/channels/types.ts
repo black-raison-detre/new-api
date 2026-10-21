@@ -99,6 +99,7 @@ export interface ChannelOtherSettings {
   vertex_key_type?: 'json' | 'api_key'
   vertex_project_id?: string
   openrouter_enterprise?: boolean
+  openrouter_native_messages?: boolean
   aws_key_type?: 'ak_sk' | 'api_key'
   aws_api_type?: 'invoke_model' | 'mantle'
   allow_service_tier?: boolean
