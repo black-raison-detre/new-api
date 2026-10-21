@@ -115,7 +115,9 @@ describe('log cost display', () => {
 
     expect(screen.getByText('$0.025')).toBeVisible()
     expect(screen.getByRole('img', { name: 'Subscription' })).toBeVisible()
-    expect(screen.queryByRole('img', { name: 'Wallet' })).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('img', { name: 'Wallet' })
+    ).not.toBeInTheDocument()
   })
 
   test('keeps legacy cost visible without inventing a funding source', () => {
@@ -231,3 +233,25 @@ describe('log cost display', () => {
     ).toHaveAttribute('data-tool-surcharge-indicator', 'true')
   })
 })
+
+test.each(['pending', 'unresolved'] as const)(
+  'OpenRouter %s cost is visibly nonfinal until a settled refresh',
+  (status) => {
+    const props = {
+      quota: 0,
+      other: { billing_mode: 'openrouter_cost', billing_status: status },
+    }
+    const view = renderCost(props)
+    expect(screen.getByText('Pending billing')).toBeVisible()
+    expect(screen.getByText('OpenRouter returned cost')).toBeVisible()
+    expect(screen.queryByText('$0')).not.toBeInTheDocument()
+    view.rerender(
+      <LogCostDisplay
+        quota={0}
+        other={{ ...props.other, billing_status: 'settled' }}
+      />
+    )
+    expect(screen.getByText('$0')).toBeVisible()
+    expect(screen.queryByText('Pending billing')).not.toBeInTheDocument()
+  }
+)

@@ -64,7 +64,11 @@ function makeLog(other: LogOtherData): UsageLog {
   }
 }
 
-function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
+function renderDetails(
+  other: LogOtherData,
+  promptTokens = 0,
+  isAdmin = false
+): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -80,7 +84,7 @@ function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
     <QueryClientProvider client={queryClient}>
       <DetailsDialog
         log={{ ...makeLog(other), prompt_tokens: promptTokens }}
-        isAdmin={false}
+        isAdmin={isAdmin}
         isRoot={false}
         open
         onOpenChange={() => undefined}
@@ -231,4 +235,44 @@ describe('usage facts billing details', () => {
     expect(screen.queryByText('seconds')).toBeNull()
     expect(screen.getByText('Total Cost')).toBeInTheDocument()
   })
+})
+
+test.each([false, true])(
+  'OpenRouter cost details only expose upstream cost and multiplier to admin=%s',
+  (isAdmin) => {
+    const client = renderDetails(
+      {
+        billing_mode: 'openrouter_cost',
+        billing_status: 'settled',
+        model_ratio: 5,
+        group_ratio: 3,
+        admin_info: { upstream_cost_usd: '0.005', group_ratio: 2 },
+      },
+      0,
+      isAdmin
+    )
+    expect(rowValue('Billing source')).toBe('OpenRouter returned cost')
+    expect(rowValue('User charge')).toBe('$0.01')
+    expect(screen.queryByText('Per-token')).not.toBeInTheDocument()
+    if (isAdmin) {
+      expect(rowValue('Upstream cost (USD)')).toBe('0.005 USD')
+      expect(rowValue('Group Ratio')).toBe('2.0000')
+    } else {
+      expect(screen.queryByText('Upstream cost (USD)')).not.toBeInTheDocument()
+      expect(screen.queryByText('Group Ratio')).not.toBeInTheDocument()
+      expect(screen.queryByText('0.005 USD')).not.toBeInTheDocument()
+    }
+    client.clear()
+  }
+)
+
+test('unresolved OpenRouter billing never displays a final user charge', () => {
+  const client = renderDetails({
+    billing_mode: 'openrouter_cost',
+    billing_status: 'unresolved',
+  })
+  expect(rowValue('Billing status')).toBe('Unresolved billing')
+  expect(rowValue('User charge')).toBe('Pending billing')
+  expect(screen.queryByText('$0.01')).not.toBeInTheDocument()
+  client.clear()
 })

@@ -119,6 +119,7 @@ func TestFormatClaudeResponseInfo_MessageStart(t *testing.T) {
 			Usage: &dto.ClaudeUsage{
 				InputTokens:              100,
 				OutputTokens:             1,
+				Cost:                     float64(0),
 				CacheCreationInputTokens: 50,
 				CacheReadInputTokens:     30,
 			},
@@ -138,6 +139,7 @@ func TestFormatClaudeResponseInfo_MessageStart(t *testing.T) {
 	if claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens != 50 {
 		t.Errorf("CachedCreationTokens = %d, want 50", claudeInfo.Usage.PromptTokensDetails.CachedCreationTokens)
 	}
+	assert.Equal(t, float64(0), claudeInfo.Usage.Cost)
 	if claudeInfo.ResponseId != "msg_123" {
 		t.Errorf("ResponseId = %s, want msg_123", claudeInfo.ResponseId)
 	}
@@ -312,6 +314,7 @@ func TestBuildOpenAIStyleUsageFromClaudeUsage(t *testing.T) {
 		ClaudeCacheCreation5mTokens: 10,
 		ClaudeCacheCreation1hTokens: 20,
 		UsageSemantic:               "anthropic",
+		Cost:                        float64(0),
 	}
 
 	openAIUsage := buildOpenAIStyleUsageFromClaudeUsage(usage)
@@ -331,6 +334,7 @@ func TestBuildOpenAIStyleUsageFromClaudeUsage(t *testing.T) {
 	if openAIUsage.UsageSource != "anthropic" {
 		t.Fatalf("UsageSource = %s, want anthropic", openAIUsage.UsageSource)
 	}
+	assert.Equal(t, float64(0), openAIUsage.Cost)
 }
 
 func TestBuildOpenAIStyleUsageFromClaudeUsagePreservesCacheCreationRemainder(t *testing.T) {

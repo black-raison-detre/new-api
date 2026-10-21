@@ -115,6 +115,7 @@ type ChannelOtherSettings struct {
 	VertexProjectID                       string                `json:"vertex_project_id,omitempty"` // 仅当 vertex_key_type=api_key 时使用；JSON 模式下从 service account 解析
 	OpenRouterEnterprise                  *bool                 `json:"openrouter_enterprise,omitempty"`
 	OpenRouterNativeMessages              bool                  `json:"openrouter_native_messages,omitempty"`
+	OpenRouterCostBilling                 bool                  `json:"openrouter_cost_billing,omitempty"`
 	ClaudeBetaQuery                       bool                  `json:"claude_beta_query,omitempty"`          // Claude 渠道是否强制追加 ?beta=true
 	AllowServiceTier                      bool                  `json:"allow_service_tier,omitempty"`         // 是否允许 service_tier 透传（默认过滤以避免额外计费）
 	AllowInferenceGeo                     bool                  `json:"allow_inference_geo,omitempty"`        // 是否允许 inference_geo 透传（仅 Claude，默认过滤以满足数据驻留合规

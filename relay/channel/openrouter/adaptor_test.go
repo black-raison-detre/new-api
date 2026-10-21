@@ -1,6 +1,7 @@
 package openrouter_test
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -78,6 +79,7 @@ func TestNativeMessagesTransportAndOptIn(t *testing.T) {
 				gotPath, gotHeader = r.URL.Path, r.Header.Clone()
 				gotBody, _ = io.ReadAll(r.Body)
 				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Generation-Id", "gen-transport-test")
 				_, _ = io.WriteString(w, `{}`)
 			}))
 			defer server.Close()
@@ -127,6 +129,7 @@ func TestNativeMessagesTransportAndOptIn(t *testing.T) {
 			assert.Equal(t, tc.wantPath, gotPath)
 			assert.JSONEq(t, string(body), string(gotBody))
 			assert.Equal(t, "Bearer channel-key", gotHeader.Get("Authorization"))
+			assert.Equal(t, "gen-transport-test", info.OpenRouterGenerationID)
 			assert.Empty(t, gotHeader.Get("x-api-key"))
 			assert.Equal(t, "Configured app", gotHeader.Get("X-OpenRouter-Title"))
 			assert.Equal(t, "configured-version", gotHeader.Get("anthropic-version"))
@@ -149,6 +152,43 @@ func TestNativeMessagesTransportAndOptIn(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDoRequestCapturesGenerationIDFromErrorResponse(t *testing.T) {
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Generation-Id", "gen-error-response")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	var recordedGenerationID string
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatOpenAI,
+		OpenRouterGenerationRecorder: func(generationID string) error {
+			recordedGenerationID = generationID
+			return errors.New("ledger unavailable")
+		},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:    constant.ChannelTypeOpenRouter,
+			ChannelBaseUrl: server.URL,
+			ApiKey:         "channel-key",
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+
+	value, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"test"}`))
+	require.NoError(t, err)
+	response, ok := value.(*http.Response)
+	require.True(t, ok)
+	defer response.Body.Close()
+	assert.Equal(t, http.StatusTooManyRequests, response.StatusCode)
+	assert.Equal(t, "gen-error-response", info.OpenRouterGenerationID)
+	assert.Equal(t, "gen-error-response", recordedGenerationID)
 }
 
 func TestOpenRouterNativeMessagesClaudeHelperRoutingPolicy(t *testing.T) {
@@ -205,12 +245,12 @@ func TestNativeMessagesResponsesAndCacheUsage(t *testing.T) {
 	oldTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
 	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
-	message := `{"id":"msg_test","type":"message","role":"assistant","model":"anthropic/test","content":[{"type":"tool_use","id":"tool1","name":"lookup","input":{"query":"hello"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":20,"cache_read_input_tokens":1691,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":12}}}`
-	stream := "event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"anthropic/test","content":[],"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":20,"cache_read_input_tokens":1691,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":12}}}}` + "\n\n" +
+	message := `{"id":"msg_test","type":"message","role":"assistant","model":"anthropic/test","content":[{"type":"tool_use","id":"tool1","name":"lookup","input":{"query":"hello"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5,"cost":0.002,"cache_creation_input_tokens":20,"cache_read_input_tokens":1691,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":12}}}`
+	stream := "event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"anthropic/test","content":[],"usage":{"input_tokens":10,"output_tokens":0,"cost":0,"cache_creation_input_tokens":20,"cache_read_input_tokens":1691,"cache_creation":{"ephemeral_5m_input_tokens":8,"ephemeral_1h_input_tokens":12}}}}` + "\n\n" +
 		"event: content_block_start\ndata: " + `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool1","name":"lookup","input":{}}}` + "\n\n" +
 		"event: content_block_delta\ndata: " + `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"hello\"}"}}` + "\n\n" +
 		"event: content_block_stop\ndata: " + `{"type":"content_block_stop","index":0}` + "\n\n" +
-		"event: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}` + "\n\n" +
+		"event: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5,"cost":0}}` + "\n\n" +
 		"event: message_stop\ndata: " + `{"type":"message_stop"}` + "\n\n"
 	for _, tc := range []struct {
 		name              string
@@ -231,13 +271,16 @@ func TestNativeMessagesResponsesAndCacheUsage(t *testing.T) {
 			}
 			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
 			adaptor.Init(info)
-			value, apiErr := adaptor.DoResponse(c, &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body))}, info)
+			headers := make(http.Header)
+			headers.Set("X-Generation-Id", "gen-response-test")
+			value, apiErr := adaptor.DoResponse(c, &http.Response{StatusCode: 200, Header: headers, Body: io.NopCloser(strings.NewReader(tc.body))}, info)
 			if tc.wantError {
 				require.NotNil(t, apiErr)
 				assert.Contains(t, apiErr.Error(), "busy")
 				return
 			}
 			require.Nil(t, apiErr)
+			assert.Equal(t, "gen-response-test", info.OpenRouterGenerationID)
 			usage, ok := value.(*dto.Usage)
 			require.True(t, ok)
 			assert.Equal(t, 10, usage.PromptTokens)
@@ -247,6 +290,14 @@ func TestNativeMessagesResponsesAndCacheUsage(t *testing.T) {
 			assert.Equal(t, 8, usage.ClaudeCacheCreation5mTokens)
 			assert.Equal(t, 12, usage.ClaudeCacheCreation1hTokens)
 			assert.Equal(t, "anthropic", usage.UsageSemantic)
+			if tc.stream {
+				assert.Equal(t, float64(0), usage.Cost)
+				assert.True(t, info.OpenRouterCostFinal)
+				assert.Contains(t, recorder.Body.String(), `"cost":0`)
+			} else {
+				assert.Equal(t, float64(0.002), usage.Cost)
+				assert.True(t, info.OpenRouterCostFinal)
+			}
 			assert.Equal(t, types.RelayFormat(types.RelayFormatClaude), info.GetFinalRequestRelayFormat())
 			if tc.stream {
 				assert.Contains(t, recorder.Body.String(), "event: message_stop")
@@ -257,6 +308,166 @@ func TestNativeMessagesResponsesAndCacheUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenRouterChatJSONRetainsExplicitZeroCost(t *testing.T) {
+	body := `{"id":"chatcmpl_test","object":"chat.completion","model":"openai/test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost":0}}`
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatOpenAI,
+		RelayMode:   relayconstant.RelayModeChatCompletions,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenRouter,
+			UpstreamModelName: "openai/test",
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+	value, apiErr := adaptor.DoResponse(c, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, info)
+	require.Nil(t, apiErr)
+	usage, ok := value.(*dto.Usage)
+	require.True(t, ok)
+	assert.Equal(t, float64(0), usage.Cost)
+	assert.True(t, info.OpenRouterCostFinal)
+	assert.Contains(t, recorder.Body.String(), `"cost":0`)
+}
+
+func TestOpenRouterResponsesJSONCostRequiresCompletedStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status    string
+		wantFinal bool
+	}{
+		{status: "completed", wantFinal: true},
+		{status: "incomplete"},
+		{status: "cancelled"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			body, err := common.Marshal(dto.OpenAIResponsesResponse{
+				ID:     "resp_test",
+				Object: "response",
+				Status: []byte(`"` + tc.status + `"`),
+				Usage:  &dto.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2, Cost: float64(0)},
+			})
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{
+				RelayFormat: types.RelayFormatOpenAIResponses,
+				RelayMode:   relayconstant.RelayModeResponses,
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter, UpstreamModelName: "openai/test"},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			value, apiErr := adaptor.DoResponse(c, &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(string(body))),
+			}, info)
+			require.Nil(t, apiErr)
+			usage, ok := value.(*dto.Usage)
+			require.True(t, ok)
+			assert.Equal(t, float64(0), usage.Cost)
+			assert.Equal(t, tc.wantFinal, info.OpenRouterCostFinal)
+		})
+	}
+}
+
+func TestOpenRouterCostFinalityForChatStreams(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantFinal bool
+	}{
+		{
+			name: "terminal accounting frame with explicit zero",
+			body: "data: " + `{"id":"chatcmpl_test","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}` + "\n\n" +
+				"data: " + `{"id":"chatcmpl_test","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: " + `{"id":"chatcmpl_test","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost":0}}` + "\n\n" +
+				"data: [DONE]\n\n",
+			wantFinal: true,
+		},
+		{
+			name: "intermediate cost followed by disconnect",
+			body: "data: " + `{"id":"chatcmpl_test","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0}}` + "\n\n" +
+				"data: " + `{"id":"chatcmpl_test","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}` + "\n\n",
+			wantFinal: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{
+				RelayFormat: types.RelayFormatOpenAI,
+				RelayMode:   relayconstant.RelayModeChatCompletions,
+				IsStream:    true,
+				DisablePing: true,
+				StartTime:   time.Now(),
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter, UpstreamModelName: "openai/test"},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			value, apiErr := adaptor.DoResponse(c, &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}, info)
+			require.Nil(t, apiErr)
+			usage, ok := value.(*dto.Usage)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantFinal, info.OpenRouterCostFinal)
+			if tc.wantFinal {
+				assert.Equal(t, float64(0), usage.Cost)
+			}
+		})
+	}
+}
+
+func TestOpenRouterCostIsNotFinalWithoutClaudeMessageStop(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"anthropic/test","content":[],"usage":{"input_tokens":1,"cost":0}}}` + "\n\n" +
+		"event: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1,"cost":0}}` + "\n\n"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatClaude,
+		RelayMode:   relayconstant.RelayModeChatCompletions,
+		IsStream:    true,
+		DisablePing: true,
+		StartTime:   time.Now(),
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:          constant.ChannelTypeOpenRouter,
+			UpstreamModelName:    "anthropic/test",
+			ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterNativeMessages: true},
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+	value, apiErr := adaptor.DoResponse(c, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, info)
+	require.Nil(t, apiErr)
+	usage, ok := value.(*dto.Usage)
+	require.True(t, ok)
+	assert.Equal(t, float64(0), usage.Cost)
+	assert.False(t, info.OpenRouterCostFinal)
 }
 
 func TestAdaptorPreservesOpenRouterHeaders(t *testing.T) {

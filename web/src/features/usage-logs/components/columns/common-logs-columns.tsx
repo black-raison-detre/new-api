@@ -168,6 +168,12 @@ function buildTypeDetailSegments(
 
   if (!other) return []
 
+  if (other.billing_mode === 'openrouter_cost') {
+    const status =
+      other.billing_status === 'settled' ? t('Settled') : t('Pending billing')
+    return [{ text: `${t('OpenRouter returned cost')} · ${status}` }]
+  }
+
   const segments: DetailSegment[] = []
 
   const priceOpts = { digitsLarge: 4, digitsSmall: 6, abbreviate: false }

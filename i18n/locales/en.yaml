@@ -37,6 +37,16 @@ relay.group_upstream_saturated: "The upstream of the current group is at capacit
 relay.retry_get_channel_failed: "Failed to get available channel for model {{.Model}} under group {{.Group}} (retry): {{.Error}}"
 relay.retry_no_available_channel: "No available channel for model {{.Model}} under group {{.Group}} (retry)"
 relay.access_token_unsupported: "Access tokens are not supported here"
+relay.openrouter_cost_not_selected: "OpenRouter actual-cost billing is unavailable for this request"
+relay.openrouter_cost_unsupported_request: "OpenRouter actual-cost billing supports text-only Chat Completions, Responses, Gemini-to-Chat, and native Claude Messages requests. Multimodal, image, audio, and Realtime requests are not supported."
+relay.openrouter_cost_subscription_only: "OpenRouter actual-cost billing requires wallet funding and does not support subscription-only billing"
+relay.openrouter_cost_active_subscription: "OpenRouter actual-cost billing requires wallet funding, but your active subscription is preferred by your billing settings. Change your billing preference or use a channel that supports subscriptions."
+relay.openrouter_cost_wallet_preference: "OpenRouter actual-cost billing requires a wallet-enabled billing preference"
+relay.openrouter_cost_wallet_positive: "Your wallet balance must be greater than zero to use OpenRouter actual-cost billing"
+relay.openrouter_cost_wallet_invalid: "Your wallet balance is outside the supported range for OpenRouter actual-cost billing"
+relay.openrouter_cost_token_positive: "Your limited API token quota must be greater than zero to use OpenRouter actual-cost billing"
+relay.openrouter_cost_setup_failed: "OpenRouter actual-cost billing could not be safely prepared. Try again or contact the administrator."
+relay.openrouter_cost_mode_changed: "A retry selected a channel with a different billing mode. The request was stopped to prevent an incorrect charge."
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}'s initial token"

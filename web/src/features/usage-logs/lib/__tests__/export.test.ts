@@ -141,3 +141,26 @@ describe('usage log CSV export', () => {
     ).toBe(`"'=HYPERLINK(""x"")","-12.5","'+cmd","a""b","two\nlines"\r\n`)
   })
 })
+
+test.each(['pending', 'unresolved', 'settled'] as const)(
+  'CSV represents OpenRouter %s cost without treating missing cost as zero',
+  (billing_status) => {
+    const t = (key: string) => key
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        quota: 0,
+        other: JSON.stringify({
+          billing_mode: 'openrouter_cost',
+          billing_status,
+        }),
+      },
+      false,
+      t
+    )
+    const header = getLogCsvHeader(false, t)
+    expect(row[header.indexOf('Cost')]).toBe(
+      billing_status === 'settled' ? '$0' : 'Pending billing'
+    )
+  }
+)

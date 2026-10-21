@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"testing"
 
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -735,4 +736,15 @@ func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
 	err := (&ChannelOtherSettings{ToolLossPolicy: "drop"}).ValidateToolLossPolicy()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tool_loss_policy")
+}
+
+func TestChannelOtherSettingsOpenRouterCostBillingRoundTrip(t *testing.T) {
+	settings := ChannelOtherSettings{OpenRouterCostBilling: true}
+	encoded, err := kitutil.Marshal(settings)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"openrouter_cost_billing":true`)
+
+	var decoded ChannelOtherSettings
+	require.NoError(t, kitutil.Unmarshal(encoded, &decoded))
+	assert.True(t, decoded.OpenRouterCostBilling)
 }

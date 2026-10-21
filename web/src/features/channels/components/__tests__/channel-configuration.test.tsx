@@ -2933,3 +2933,43 @@ test('AWS interface selection is disabled without sensitive channel write permis
     await screen.findByRole('combobox', { name: 'AWS API' })
   ).toBeDisabled()
 })
+
+test('OpenRouter billing source can be selected with the keyboard and saved', async () => {
+  editingChannel = { ...editingChannel, type: 20, settings: '{}' }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  const selector = await screen.findByRole('combobox', {
+    name: 'Billing source',
+  })
+  expect(selector).toHaveTextContent('Local pricing')
+  act(() => selector.focus())
+  await user.keyboard('{ArrowDown}')
+  await user.keyboard('{End}{Enter}')
+  await waitFor(() =>
+    expect(selector).toHaveTextContent('OpenRouter returned cost')
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as { settings: string }
+  expect(JSON.parse(payload.settings).openrouter_cost_billing).toBe(true)
+})
+
+test('OpenRouter enterprise account shows disabled local billing even with stored cost billing', async () => {
+  editingChannel = {
+    ...editingChannel,
+    type: 20,
+    settings: '{"openrouter_enterprise":true,"openrouter_cost_billing":true}',
+  }
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  const selector = await screen.findByRole('combobox', {
+    name: 'Billing source',
+  })
+  await waitFor(() => expect(selector).toBeDisabled())
+  expect(selector).toHaveTextContent('Local pricing')
+  expect(
+    screen.getByText('Enterprise accounts use local pricing.')
+  ).toBeVisible()
+})

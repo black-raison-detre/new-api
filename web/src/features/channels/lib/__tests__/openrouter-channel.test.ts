@@ -90,3 +90,62 @@ test('changing away from OpenRouter clears both provider settings', () => {
   expect(settings).not.toHaveProperty('openrouter_enterprise')
   expect(settings).not.toHaveProperty('openrouter_native_messages')
 })
+
+test.each([false, true])(
+  'OpenRouter cost billing round-trips %s',
+  (enabled) => {
+    const form = channelFormSchema.parse({
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'OpenRouter',
+      type: 20,
+      key: 'test-key',
+      models: 'openai/gpt-4.1',
+      openrouter_cost_billing: enabled,
+      settings: '{"custom_option":true}',
+    })
+    const payload = transformFormDataToCreatePayload(form).channel
+    expect(JSON.parse(payload.settings ?? '{}')).toMatchObject({
+      custom_option: true,
+      openrouter_cost_billing: enabled,
+    })
+    const channel = channelSchema.parse({
+      ...payload,
+      id: 7,
+      status: 1,
+      created_time: 1,
+      test_time: 0,
+      response_time: 0,
+      balance_updated_time: 0,
+      other: '',
+      remark: '',
+    })
+    expect(
+      transformChannelToFormDefaults(channel).openrouter_cost_billing
+    ).toBe(enabled)
+    expect(
+      transformChannelToFormDefaults({ ...channel, settings: '{}' })
+        .openrouter_cost_billing
+    ).toBe(false)
+  }
+)
+
+test.each([1, 20])(
+  'unsupported channel type %s or enterprise disables cost billing',
+  (type) => {
+    const form = channelFormSchema.parse({
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'Channel',
+      type,
+      key: 'test-key',
+      models: 'openai/gpt-4.1',
+      openrouter_cost_billing: true,
+      is_enterprise_account: true,
+      settings: '{"openrouter_cost_billing":true}',
+    })
+    const settings = JSON.parse(
+      transformFormDataToCreatePayload(form).channel.settings ?? '{}'
+    )
+    if (type === 20) expect(settings.openrouter_cost_billing).toBe(false)
+    else expect(settings).not.toHaveProperty('openrouter_cost_billing')
+  }
+)

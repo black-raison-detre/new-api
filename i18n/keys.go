@@ -46,6 +46,16 @@ const (
 	MsgRelayRetryGetChannelFailed        = "relay.retry_get_channel_failed"
 	MsgRelayRetryNoAvailableChannel      = "relay.retry_no_available_channel"
 	MsgRelayAccessTokenUnsupported       = "relay.access_token_unsupported"
+	MsgRelayOpenRouterCostNotSelected    = "relay.openrouter_cost_not_selected"
+	MsgRelayOpenRouterCostUnsupported    = "relay.openrouter_cost_unsupported_request"
+	MsgRelayOpenRouterCostSubscription   = "relay.openrouter_cost_subscription_only"
+	MsgRelayOpenRouterCostActiveSub      = "relay.openrouter_cost_active_subscription"
+	MsgRelayOpenRouterCostWalletPref     = "relay.openrouter_cost_wallet_preference"
+	MsgRelayOpenRouterCostWalletPositive = "relay.openrouter_cost_wallet_positive"
+	MsgRelayOpenRouterCostWalletInvalid  = "relay.openrouter_cost_wallet_invalid"
+	MsgRelayOpenRouterCostTokenPositive  = "relay.openrouter_cost_token_positive"
+	MsgRelayOpenRouterCostSetupFailed    = "relay.openrouter_cost_setup_failed"
+	MsgRelayOpenRouterCostModeChanged    = "relay.openrouter_cost_mode_changed"
 )
 
 // Emails and the name of the token created at registration, in the

@@ -45,6 +45,13 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	// compute usage
 	usage := &dto.Usage{}
 	service.ApplyResponsesUsage(usage, responsesResponse.Usage)
+	var responseStatus string
+	if err := common.Unmarshal(responsesResponse.Status, &responseStatus); err == nil &&
+		info.GetChannelType() == constant.ChannelTypeOpenRouter &&
+		responseStatus == "completed" &&
+		usage.Cost != nil {
+		info.OpenRouterCostFinal = true
+	}
 	// Count actual tool invocations from Output (not tool declarations).
 	for _, output := range responsesResponse.Output {
 		switch output.Type {
@@ -76,6 +83,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	defer service.CloseResponseBodyGracefully(resp)
 
 	accumulator := service.NewResponsesUsageAccumulator(info)
+	var completedCost any
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
@@ -90,12 +98,25 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
 		sendResponsesStreamData(c, streamResponse, data)
+		if streamResponse.Type == "response.completed" &&
+			streamResponse.Response != nil &&
+			streamResponse.Response.Usage != nil &&
+			streamResponse.Response.Usage.Cost != nil {
+			completedCost = streamResponse.Response.Usage.Cost
+		}
 		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
 	})
 
 	common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
 	info.StreamStatus.RequireTerminal()
-	return accumulator.Finish(), nil
+	usage := accumulator.Finish()
+	if info.GetChannelType() == constant.ChannelTypeOpenRouter &&
+		completedCost != nil &&
+		info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
+		usage.Cost = completedCost
+		info.OpenRouterCostFinal = true
+	}
+	return usage, nil
 }
 
 func rewriteSGLangResponsesCreatedAt(info *relaycommon.RelayInfo, payload []byte, path string, createdAt dto.IntValue) []byte {

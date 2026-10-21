@@ -72,6 +72,50 @@ func TestOaiResponsesHandlerCountsOutputCallsNotDeclarations(t *testing.T) {
 	assert.NotContains(t, info.ResponsesUsageInfo.BuiltInTools, "unpriced_fn")
 }
 
+func TestOpenRouterResponsesStreamCostRequiresCompletedEvent(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, tc := range []struct {
+		name      string
+		event     string
+		wantFinal bool
+	}{
+		{
+			name:      "completed event with explicit zero",
+			event:     `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost":0}}}`,
+			wantFinal: true,
+		},
+		{
+			name:  "incomplete event cost remains pending",
+			event: `{"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,"cost":0}}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := "data: " + tc.event + "\n\ndata: [DONE]\n\n"
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			info := &relaycommon.RelayInfo{
+				IsStream:    true,
+				DisablePing: true,
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter},
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			}
+			usage, apiErr := OaiResponsesStreamHandler(c, info, resp)
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.Equal(t, tc.wantFinal, info.OpenRouterCostFinal)
+			assert.Equal(t, float64(0), usage.Cost)
+		})
+	}
+}
+
 func TestOaiResponsesHandlerDeclaredToolsWithoutOutputCountZero(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

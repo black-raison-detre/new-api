@@ -292,6 +292,7 @@ const SENSITIVE_FORM_FIELDS = [
   'advanced_custom',
   'is_enterprise_account',
   'openrouter_native_messages',
+  'openrouter_cost_billing',
   'vertex_key_type',
   'vertex_project_id',
   'aws_key_type',
@@ -3739,6 +3740,69 @@ export function ChannelMutateDrawer({
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
+                  </FormItem>
+                )}
+              />
+            )}
+
+            {currentType === 20 && (
+              <FormField
+                control={form.control}
+                name='openrouter_cost_billing'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Billing source')}</FormLabel>
+                    <Select
+                      disabled={
+                        sensitiveLocked || formValues.is_enterprise_account
+                      }
+                      items={[
+                        { value: 'local', label: t('Local pricing') },
+                        {
+                          value: 'openrouter',
+                          label: t('OpenRouter returned cost'),
+                        },
+                      ]}
+                      value={
+                        field.value && !formValues.is_enterprise_account
+                          ? 'openrouter'
+                          : 'local'
+                      }
+                      onValueChange={(value) =>
+                        field.onChange(value === 'openrouter')
+                      }
+                    >
+                      <FormControl>
+                        <SelectTrigger className='w-full'>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent alignItemWithTrigger={false}>
+                        <SelectGroup>
+                          <SelectItem value='local'>
+                            {t('Local pricing')}
+                          </SelectItem>
+                          <SelectItem value='openrouter'>
+                            {t('OpenRouter returned cost')}
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FormDescription>
+                      {formValues.is_enterprise_account
+                        ? t('Enterprise accounts use local pricing.')
+                        : t(
+                            'Bill wallet-funded text requests using the returned OpenRouter cost and the existing group multiplier. Subscription-funded requests are not supported. Missing costs remain pending; provider-direct BYOK charges are excluded.'
+                          )}
+                      {field.value && !formValues.is_enterprise_account && (
+                        <span className='mt-1 block'>
+                          {t(
+                            'No balance is reserved before the request. The final charge may make the balance negative.'
+                          )}
+                        </span>
+                      )}
+                    </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />

@@ -87,6 +87,194 @@ func (info *RelayInfo) UsesOpenRouterNativeMessages() bool {
 		info.RelayMode != relayconstant.RelayModeResponsesCompact
 }
 
+func (info *RelayInfo) OpenRouterCostBillingConfigured() bool {
+	return info != nil && info.ChannelMeta != nil &&
+		info.ChannelType == constant.ChannelTypeOpenRouter &&
+		info.ChannelOtherSettings.OpenRouterCostBilling &&
+		!info.ChannelOtherSettings.IsOpenRouterEnterprise()
+}
+
+// SupportsOpenRouterCostBillingRequest rejects formats where OpenRouter's
+// generation cost cannot safely represent the request's full billable work.
+func (info *RelayInfo) SupportsOpenRouterCostBillingRequest(c *gin.Context) bool {
+	if !info.OpenRouterCostBillingConfigured() || c == nil || c.Request == nil || websocket.IsWebSocketUpgrade(c.Request) {
+		return false
+	}
+
+	switch request := info.Request.(type) {
+	case *dto.GeneralOpenAIRequest:
+		if info.RelayFormat != types.RelayFormatOpenAI || len(request.Messages) == 0 || request.Prompt != nil || request.Input != nil || len(request.Audio) > 0 || len(request.Modalities) > 0 {
+			return false
+		}
+		if meta := request.GetTokenCountMeta(); meta != nil && len(meta.Files) > 0 {
+			return false
+		}
+		for i := range request.Messages {
+			if !openRouterTextContent(request.Messages[i].Content) {
+				return false
+			}
+			for _, part := range request.Messages[i].ParseContent() {
+				if part.Type != dto.ContentTypeText {
+					return false
+				}
+			}
+		}
+		return true
+	case *dto.OpenAIResponsesRequest:
+		if info.RelayFormat != types.RelayFormatOpenAIResponses || info.RelayMode == relayconstant.RelayModeResponsesCompact {
+			return false
+		}
+		if openRouterResponsesInputHasMedia(request.Input) || openRouterResponsesInputHasMedia(request.Tools) {
+			return false
+		}
+		if meta := request.GetTokenCountMeta(); meta != nil && len(meta.Files) > 0 {
+			return false
+		}
+		for _, item := range request.ParseInput() {
+			if item.Type != "input_text" && item.Type != "output_text" {
+				return false
+			}
+		}
+		inputTypes := gjson.GetBytes(request.Input, "#.type").Array()
+		for _, inputType := range inputTypes {
+			switch inputType.String() {
+			case "", "message", "input_text", "output_text", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "local_shell_call_output":
+			default:
+				return false
+			}
+		}
+		return true
+	case *dto.ClaudeRequest:
+		if !info.UsesOpenRouterNativeMessages() {
+			return false
+		}
+		if !request.IsStringSystem() {
+			for _, part := range request.ParseSystem() {
+				if part.Type != "text" {
+					return false
+				}
+			}
+		}
+		if meta := request.GetTokenCountMeta(); meta != nil && len(meta.Files) > 0 {
+			return false
+		}
+		for i := range request.Messages {
+			if request.Messages[i].IsStringContent() {
+				continue
+			}
+			parts, err := request.Messages[i].ParseContent()
+			if err != nil {
+				return false
+			}
+			for _, part := range parts {
+				if part.Type != "text" && part.Type != "tool_use" && part.Type != "tool_result" && part.Type != "thinking" && part.Type != "redacted_thinking" {
+					return false
+				}
+				if part.Type == "tool_result" {
+					for _, nested := range part.ParseMediaContent() {
+						if nested.Type != "text" {
+							return false
+						}
+					}
+				}
+			}
+		}
+		return true
+	case *dto.GeminiChatRequest:
+		if info.RelayFormat != types.RelayFormatGemini || len(request.Requests) > 0 || len(request.GenerationConfig.ImageConfig) > 0 || len(request.GenerationConfig.SpeechConfig) > 0 {
+			return false
+		}
+		for _, modality := range request.GenerationConfig.ResponseModalities {
+			if !strings.EqualFold(modality, "TEXT") {
+				return false
+			}
+		}
+		for _, content := range request.Contents {
+			for _, part := range content.Parts {
+				if part.InlineData != nil || part.FileData != nil || len(part.VideoMetadata) > 0 {
+					return false
+				}
+			}
+		}
+		if meta := request.GetTokenCountMeta(); meta != nil && len(meta.Files) > 0 {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func openRouterTextContent(content any) bool {
+	if content == nil {
+		return true
+	}
+	if _, ok := content.(string); ok {
+		return true
+	}
+	parts := make([]dto.MediaContent, 0)
+	switch content := content.(type) {
+	case []dto.MediaContent:
+		parts = content
+	case []any:
+		for _, item := range content {
+			part, ok := item.(map[string]any)
+			if !ok {
+				if typed, ok := item.(dto.MediaContent); ok {
+					parts = append(parts, typed)
+					continue
+				}
+				return false
+			}
+			partType, ok := part["type"].(string)
+			if !ok || partType != dto.ContentTypeText {
+				return false
+			}
+		}
+	default:
+		return false
+	}
+	for _, part := range parts {
+		if part.Type != dto.ContentTypeText {
+			return false
+		}
+	}
+	return true
+}
+
+func openRouterResponsesInputHasMedia(input json.RawMessage) bool {
+	if len(input) == 0 {
+		return false
+	}
+	stack := []gjson.Result{gjson.ParseBytes(input)}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		value := stack[last]
+		stack = stack[:last]
+		if value.IsArray() {
+			value.ForEach(func(_, child gjson.Result) bool {
+				stack = append(stack, child)
+				return true
+			})
+			continue
+		}
+		if value.Type != gjson.JSON {
+			continue
+		}
+		switch value.Get("type").String() {
+		case "input_image", "input_audio", "input_file", "input_video", "image", "audio", "video", "file", "image_generation", "audio_generation", "video_generation":
+			return true
+		}
+		for _, key := range []string{"input", "content"} {
+			child := value.Get(key)
+			if child.Exists() {
+				stack = append(stack, child)
+			}
+		}
+	}
+	return false
+}
+
 type TokenCountMeta struct {
 	//promptTokens int
 	estimatePromptTokens int
@@ -154,6 +342,23 @@ type RelayInfo struct {
 	// BillingSource indicates whether this request is billed from wallet quota or subscription.
 	// "" or "wallet" => wallet; "subscription" => subscription
 	BillingSource string
+	// OpenRouterCostBilling is selected once for the request and remains locked
+	// across channel retries. Its cost and final group snapshot are settled from
+	// OpenRouter's reported USD cost instead of local model prices.
+	OpenRouterCostBilling    bool
+	OpenRouterCostGroupRatio float64
+	// OpenRouterGenerationID is captured from OpenRouter's X-Generation-Id
+	// response header. It is per-attempt and is never populated from body IDs.
+	OpenRouterGenerationID string
+	// OpenRouterGenerationRecorder persists the current attempt's generation ID
+	// before any response stream is relayed to the client. It never receives or
+	// stores a channel credential.
+	OpenRouterGenerationRecorder func(string) error
+	OpenRouterCostHeartbeatStop  func()
+	// OpenRouterCostFinal marks cost from a protocol-complete response boundary;
+	// intermediate stream usage snapshots must be reconciled through the API.
+	OpenRouterCostFinal bool
+	BillingPathMode     string
 	// SubscriptionId is the user_subscriptions.id used when BillingSource == "subscription"
 	SubscriptionId int
 	// SubscriptionPreConsumed is the amount pre-consumed on subscription item (quota units or 1)
@@ -281,6 +486,8 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	info.ResponseModel = nil
 	info.FinalRequestRelayFormat = ""
 	info.RequestConversionChain = nil
+	info.OpenRouterGenerationID = ""
+	info.OpenRouterCostFinal = false
 	info.InitRequestConversionChain()
 	// Per-attempt only. Do not clear StreamStatus, conversion diagnostics,
 	// LastError, or billing accumulators — those are request-scoped.

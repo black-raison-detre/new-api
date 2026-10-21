@@ -501,3 +501,15 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
     )
   }
 )
+
+test('OpenRouter preview uses returned cost status instead of local unit prices', () => {
+  const preview = renderPreview({
+    billing_mode: 'openrouter_cost',
+    billing_status: 'pending',
+    model_ratio: 10,
+    group_ratio: 2,
+  })
+  expect(preview).toHaveTextContent('OpenRouter returned cost')
+  expect(preview).toHaveTextContent('Pending billing')
+  expect(preview).not.toHaveTextContent('Per-token')
+})

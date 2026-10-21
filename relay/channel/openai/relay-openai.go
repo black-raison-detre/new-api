@@ -187,6 +187,23 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(usageFrame))
+	if info.GetChannelType() == constant.ChannelTypeOpenRouter &&
+		info.StreamStatus != nil &&
+		info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone &&
+		info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) &&
+		!info.StreamStatus.HasErrors() {
+		var accountingFrame struct {
+			Usage *dto.Usage `json:"usage"`
+			Error any        `json:"error"`
+		}
+		if err := common.UnmarshalJsonStr(lastStreamData, &accountingFrame); err == nil &&
+			accountingFrame.Usage != nil && accountingFrame.Usage.Cost != nil {
+			if accountingFrame.Error == nil {
+				usage.Cost = accountingFrame.Usage.Cost
+				info.OpenRouterCostFinal = true
+			}
+		}
+	}
 
 	for _, name := range streamFunctionCallNames {
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
@@ -317,6 +334,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			PromptTokens:     info.GetEstimatePromptTokens(),
 			CompletionTokens: completionTokens,
 			TotalTokens:      info.GetEstimatePromptTokens() + completionTokens,
+			Cost:             simpleResponse.Usage.Cost,
 		}
 		simpleResponse.Usage = *fallbackUsage
 		usageModified = true
@@ -366,6 +384,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)
+	if info.GetChannelType() == constant.ChannelTypeOpenRouter && simpleResponse.Usage.Cost != nil {
+		info.OpenRouterCostFinal = true
+	}
 
 	return &simpleResponse.Usage, nil
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -55,17 +56,40 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (any, error) {
+	var response any
+	var err error
 	if info.UsesOpenRouterNativeMessages() {
-		return channel.DoApiRequest(a, c, info, body)
+		response, err = channel.DoApiRequest(a, c, info, body)
+	} else {
+		response, err = a.Adaptor.DoRequest(c, info, body)
 	}
-	return a.Adaptor.DoRequest(c, info, body)
+	if httpResponse, ok := response.(*http.Response); ok && httpResponse != nil && info != nil {
+		generationID := httpResponse.Header.Get("X-Generation-Id")
+		info.OpenRouterGenerationID = generationID
+		if generationID != "" && info.OpenRouterGenerationRecorder != nil {
+			if err := info.OpenRouterGenerationRecorder(generationID); err != nil {
+				common.SysLog(common.LogText("failed to persist OpenRouter generation ID"))
+			}
+		}
+	}
+	return response, err
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, response *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
-	if info.UsesOpenRouterNativeMessages() {
-		return (&claude.Adaptor{}).DoResponse(c, response, info)
+	if response != nil && info != nil {
+		info.OpenRouterGenerationID = response.Header.Get("X-Generation-Id")
 	}
-	return a.Adaptor.DoResponse(c, response, info)
+	var usage any
+	var apiErr *types.NewAPIError
+	if info.UsesOpenRouterNativeMessages() {
+		usage, apiErr = (&claude.Adaptor{}).DoResponse(c, response, info)
+		if info.IsStream && (apiErr != nil || info.StreamStatus == nil || info.StreamStatus.ResponseOutcome() != string(relaycommon.ResponseOutcomeCompleted)) {
+			info.OpenRouterCostFinal = false
+		}
+	} else {
+		usage, apiErr = a.Adaptor.DoResponse(c, response, info)
+	}
+	return usage, apiErr
 }
 
 func (a *Adaptor) GetModelList() []string {

@@ -47,6 +47,9 @@ format; retain new-api's authorization, validation, billing, and logging control
   their matching OpenRouter endpoints. Native Messages is opt-in for both
   existing and new channels; enterprise channels retain the legacy path.
 - [x] Keep Gemini conversion until native upstream support is verified.
+- [x] Add opt-in OpenRouter returned-cost billing for wallet-funded text
+  requests before implementing configurable provider routing. Apply the existing
+  effective group multiplier and retain existing currency display conversion.
 - [ ] Preserve documented OpenRouter routing fields without requiring blanket
   body passthrough. Define precedence between client options and administrator
   policy; preserve explicit zero and false values.
@@ -172,7 +175,8 @@ format; retain new-api's authorization, validation, billing, and logging control
   `/private/tmp/new-api-openrouter-native-desktop.png` and
   `/private/tmp/new-api-openrouter-native-narrow-enterprise.png`.
 - Independent working-tree source review approved the native implementation;
-  nothing is staged or committed. Full `go test ./...`, deployed gateway
+  that milestone was committed as `07f604dcb`. At that milestone, full
+  `go test ./...`, deployed gateway
   authentication, persistent quota reservation/settlement/refunds and a live
   enterprise endpoint are outside this verification.
 - Reproduction artifacts (outside Git, no credential output):
@@ -184,6 +188,118 @@ format; retain new-api's authorization, validation, billing, and logging control
   `/private/tmp/new-api-openrouter-native-go.log`,
   `/private/tmp/new-api-openrouter-native-integration.log`,
   `/private/tmp/new-api-openrouter-native-web.log`.
+
+### Returned-cost wallet billing (2026-10-21)
+
+- Channel-level `openrouter_cost_billing` defaults to false. Standard OpenRouter
+  channels can charge the final reported USD cost using the existing effective
+  group multiplier. Enterprise channels keep local pricing.
+- The first version is wallet-only. Preserve the user's funding preference;
+  reject subscription-funded requests before forwarding instead of silently
+  switching them to a wallet charge.
+- Do not reserve wallet credit in advance. Require positive wallet and limited
+  API-token balances at admission; actual settlement can leave debt. Currency
+  conversion remains a presentation concern, and no new markup control is added.
+- Explicit zero cost is valid only at a complete accounting boundary. Missing,
+  invalid, or interrupted accounting remains pending for generation-cost lookup;
+  never silently substitute a free charge or local model price.
+- Persist generation identity and reconcile pending charges durably. Ledger and
+  accounting updates must prevent duplicate debits across retries or restarts.
+  Preserve administrator-only upstream cost details and public pending status.
+- Provider-direct BYOK inference fees are outside the returned OpenRouter charge.
+  Catalog prices remain useful metadata, not the settlement source in this mode.
+- Implemented the setting in the existing channel editor and pending/settled
+  billing details in the existing usage logs and CSV export. Frontend copy is
+  present in all seven locales; new AI-client errors use the three backend locales.
+- Primary-database settlement atomically updates the ledger, wallet, token,
+  request counters and channel usage. Header generation IDs are saved before
+  streaming; an active-request heartbeat delays recovery until the request ends
+  or its lease expires. Cross-mode channel retries are rejected, and retries stop
+  after an upstream generation ID has been acquired.
+- Log recovery and foreground completion share one idempotent projection. A
+  separate log-database outage does not block charging in the primary database.
+  SQLite takes write intent before projecting to a separate log database;
+  ClickHouse updates wait for mutation completion. Dashboard rows carry a nullable
+  unique request discriminator so ordinary hourly cache flushes cannot alter them.
+- Focused backend suites and the returned-cost regressions passed on real
+  SQLite 3.50.4, MySQL 8.0.46 and PostgreSQL 15.19, with no matrix skips. Coverage
+  includes no reservation, frozen group ratio, negative credit, limited-token and
+  subscription admission, explicit zero, missing/incomplete cost, concurrent
+  settlement, restart recovery, missing logs, log outages, deferred SQLite
+  transactions and mixed ordinary/actual-cost dashboard updates.
+- Fresh and released-schema upgrade checks passed twice each on all three primary
+  databases (12 startup/migration runs), using the hosted `v1.0.0-rc.45` release
+  as the upgrade baseline. Existing balances, channel settings, token uniqueness,
+  dashboard aggregates and indexes were retained. The expected additions are the
+  ledger and nullable `quota_data.billing_request_id` column/unique index.
+- Real ClickHouse 25.8.33.6 log verification passed pending-to-settled mutation,
+  immediate final-state readback, one consume log and one wallet debit.
+- Frontend validation passed 165 tests across six existing files, typecheck,
+  targeted lint, i18n sync and production build. Inspected production-build
+  screenshots at 1440x1050 and 390x844 cover channel selection/keyboard use,
+  enterprise disabling and administrator/user pending/settled log views.
+  Management APIs were mocked for these browser checks.
+- Six live factory/adaptor calls (Chat, Responses and native Messages, JSON/SSE)
+  all returned HTTP 200 with final cost and generation headers. Initial generation
+  lookups sometimes returned 404; later read-only lookups matched every inline
+  cost. An additional authenticated gateway call exercised model mapping without
+  local pricing, group multiplier 2, a 2-quota debit from a 1-quota wallet to -1,
+  exactly one consume log, and rejection of the next request before forwarding.
+  Seven responses reported USD 0.0000154 total, below the approved USD 0.01 budget.
+- Independent UI and backend source review approved the working-tree feature
+  after fixing the reported recovery races. The commit-time audit additionally
+  covered the token-deletion and public-log regressions below.
+- Precommit review found that soft-deleting a token could block an outstanding
+  charge. Settlement now uses the original owner-bound token row for accounting
+  even after deletion, while ordinary token access remains revoked. Foreground
+  and recovery regressions prove one debit and preserve the deletion marker.
+- Actual-cost log projection strips public `group_ratio` and `user_group_ratio`
+  while retaining the effective ratio under administrator metadata. Real user
+  and token-log API regressions verify privacy and retain ordinary local-pricing
+  metadata. The updated model/service/relay suites passed on all three primary
+  databases without skips; the complete root suite passed again with only the
+  documented release-baseline WebSocket fixture excluded. No schema changed in
+  these precommit fixes.
+- Strict full-root `go test ./...` was run. Its only failure after the required
+  sandbox escalation was the pre-existing
+  `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` WebSocket fixture;
+  the same failure reproduced on the untouched release baseline. The complete
+  root suite excluding only that exact fixture passed. Final targeted checks
+  passed for backend locale rendering, numeric bounds and invalid-context errors
+  after the last localization fix. This is not an unmodified full-suite pass.
+- Removed the three isolated database containers and restored the previously
+  stopped Colima VM to stopped state. No existing containers were removed.
+- Reproduction commands (from the root unless noted; database commands used
+  isolated `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN`):
+
+  ```sh
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./model ./service ./relay ./relay/channel/openrouter ./relay/channel/openai ./relay/channel/claude -count=1
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./... -count=1
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./... -count=1 -skip '^TestAdaptorMasksDialedHostsInDialFailure$/^channel_proxy_host$'
+  # Inside relaykit/:
+  GOWORK=off GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./dto -count=1
+  GOWORK=off GOCACHE=/private/tmp/new-api-openrouter-gocache go build -p 2 ./...
+  # Inside web/:
+  bun run test src/features/channels/lib/__tests__/openrouter-channel.test.ts src/features/channels/components/__tests__/channel-configuration.test.tsx src/features/usage-logs/components/__tests__/cost-display.test.tsx src/features/usage-logs/components/__tests__/usage-facts.test.tsx src/features/usage-logs/components/__tests__/detail-preview.test.tsx src/features/usage-logs/lib/__tests__/export.test.ts
+  bun run typecheck
+  bun run build
+  bun run i18n:sync
+  ```
+
+- Local verification artifacts: `/private/tmp/new-api-openrouter-cost-service-matrix.log`,
+  `/private/tmp/new-api-openrouter-cost-backend-tests.log`,
+  `/private/tmp/new-api-openrouter-cost-final-migration-{engine}-{fresh,upgrade}-{1,2}.log`,
+  `/private/tmp/new-api-openrouter-cost-clickhouse.log`,
+  `/private/tmp/new-api-openrouter-cost-live-results.json`,
+  `/private/tmp/new-api-openrouter-cost-lookup-results.json`,
+  `/private/tmp/new-api-openrouter-cost-gateway.log`,
+  `/private/tmp/new-api-openrouter-cost-logs-browser.log`, and
+  `/private/tmp/new-api-openrouter-cost-full-go-unsandboxed.log`,
+  `/private/tmp/new-api-openrouter-cost-full-go-excluding-baseline.log`, and
+  `/private/tmp/new-api-openrouter-cost-final-guards.log`,
+  `/private/tmp/new-api-openrouter-cost-precommit-regression-before.log`,
+  `/private/tmp/new-api-openrouter-cost-precommit-fixed-tests.log`, and
+  `/private/tmp/new-api-openrouter-cost-precommit-full-go.log`.
 
 ## Phase 2: Catalog and provider metadata
 
@@ -248,12 +364,14 @@ format; retain new-api's authorization, validation, billing, and logging control
   matching the staged source. No live or database checks were repeated.
 - All staged Go files are gofmt-clean. Cached whitespace checks passed; all seven
   locale files contain exactly two added keys with no changed existing values.
-- Full `go test ./...` and the live gateway proof boundaries above remain open.
+- At the native Messages milestone, full `go test ./...` and live gateway
+  accounting remained unverified. The returned-cost milestone above records the
+  subsequent full-suite exception and authenticated gateway settlement check.
 
 The initial assessment covered source inspection and public OpenRouter metadata.
-The adaptor foundation and native Messages subsequently passed the focused
-local, database, frontend and live checks recorded above. Full `go test ./...`
-remains unperformed.
+The adaptor foundation, native Messages and returned-cost wallet billing
+subsequently passed the focused local, database, frontend and live checks above.
+The full-root test exception is recorded in the returned-cost milestone.
 
 ## Upstream references
 

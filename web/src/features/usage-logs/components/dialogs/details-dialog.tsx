@@ -182,6 +182,42 @@ function BillingBreakdown(props: {
   const fmtPrice = (usd: number) => formatBillingCurrencyFromUSD(usd, priceOpts)
   const baseInputUSD = other.model_ratio != null ? other.model_ratio * 2.0 : 0
 
+  if (other.billing_mode === 'openrouter_cost') {
+    const settled = other.billing_status === 'settled'
+    let status = t('Pending billing')
+    if (settled) status = t('Settled')
+    if (other.billing_status === 'unresolved') status = t('Unresolved billing')
+    const upstreamCost = other.admin_info?.upstream_cost_usd
+    return (
+      <DetailSection label={t('Billing Details')}>
+        <DetailRow
+          label={t('Billing source')}
+          value={t('OpenRouter returned cost')}
+        />
+        <DetailRow label={t('Billing status')} value={status} />
+        <DetailRow
+          label={t('User charge')}
+          value={settled ? formatLogQuota(log.quota) : t('Pending billing')}
+          mono
+        />
+        {isAdmin && upstreamCost != null && (
+          <DetailRow
+            label={t('Upstream cost (USD)')}
+            value={`${upstreamCost} USD`}
+            mono
+          />
+        )}
+        {isAdmin && other.admin_info?.group_ratio != null && (
+          <DetailRow
+            label={t('Group Ratio')}
+            value={formatRatio(other.admin_info.group_ratio)}
+            mono
+          />
+        )}
+      </DetailSection>
+    )
+  }
+
   if (isTieredExpr) {
     rows.push({
       label: t('Billing Mode'),

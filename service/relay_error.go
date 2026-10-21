@@ -21,6 +21,11 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 	if err == nil {
 		return PolicyDecision{Action: "stop", Reason: "request_completed", Source: "system"}
 	}
+	if value, ok := c.Get("relay_info"); ok {
+		if info, ok := value.(*relaycommon.RelayInfo); ok && info.OpenRouterCostBilling && info.OpenRouterGenerationID != "" {
+			return PolicyDecision{Action: "stop", Reason: "openrouter_generation_pending", Source: "billing_safety"}
+		}
+	}
 	if ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		source := RequestPolicy(c).SessionModeSource
 		if source == "" {

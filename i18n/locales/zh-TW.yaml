@@ -38,6 +38,16 @@ relay.group_upstream_saturated: "目前分組上游負載已飽和，請稍後�
 relay.retry_get_channel_failed: "獲取分組 {{.Group}} 下模型 {{.Model}} 的可用管道失敗（retry）：{{.Error}}"
 relay.retry_no_available_channel: "分組 {{.Group}} 下模型 {{.Model}} 的可用管道不存在（retry）"
 relay.access_token_unsupported: "暫不支援使用 access token"
+relay.openrouter_cost_not_selected: "此請求未啟用 OpenRouter 實際費用計費"
+relay.openrouter_cost_unsupported_request: "OpenRouter 實際費用計費僅支援純文字 Chat Completions、Responses、Gemini 轉 Chat 與原生 Claude Messages 請求，不支援多模態、圖像、音訊或 Realtime 請求。"
+relay.openrouter_cost_subscription_only: "OpenRouter 實際費用計費需要使用錢包，不支援僅使用訂閱額度"
+relay.openrouter_cost_active_subscription: "OpenRouter 實際費用計費需要使用錢包，但您的計費設定優先使用目前有效的訂閱。請變更計費偏好，或使用支援訂閱計費的通道。"
+relay.openrouter_cost_wallet_preference: "OpenRouter 實際費用計費需要啟用錢包計費偏好"
+relay.openrouter_cost_wallet_positive: "使用 OpenRouter 實際費用計費時，錢包餘額必須大於零"
+relay.openrouter_cost_wallet_invalid: "您的錢包餘額超出 OpenRouter 實際費用計費支援的範圍"
+relay.openrouter_cost_token_positive: "使用 OpenRouter 實際費用計費時，限額 API 權杖的剩餘額度必須大於零"
+relay.openrouter_cost_setup_failed: "無法安全準備 OpenRouter 實際費用計費。請重試或聯絡管理員。"
+relay.openrouter_cost_mode_changed: "重試時選擇的通道計費模式已變更。為避免扣費錯誤，請求已停止。"
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}的初始令牌"

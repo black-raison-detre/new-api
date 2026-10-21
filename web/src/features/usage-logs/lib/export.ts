@@ -67,6 +67,14 @@ export function getLogCsvRow(
       (other?.cache_creation_tokens_1h ?? 0) ||
     other?.cache_creation_tokens ||
     0
+  let cost = usage ? formatLogQuota(log.quota ?? 0) : ''
+  if (
+    usage &&
+    other?.billing_mode === 'openrouter_cost' &&
+    other.billing_status !== 'settled'
+  ) {
+    cost = t('Pending billing')
+  }
   let channel = ''
   if (log.channel) {
     channel = log.channel_name
@@ -86,7 +94,7 @@ export function getLogCsvRow(
     usage ? String(log.completion_tokens ?? 0) : '',
     usage ? String(other?.cache_tokens ?? 0) : '',
     usage ? String(cacheWrite) : '',
-    usage ? formatLogQuota(log.quota ?? 0) : '',
+    cost,
     isTimingLogType(log.type) ? `${log.use_time ?? 0}s` : '',
     log.ip ?? '',
     log.request_id ?? '',

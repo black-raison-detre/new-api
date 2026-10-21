@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -23,6 +24,13 @@ import (
 // provide the current request body through BodyStorage or BillingRequestInput;
 // channel retries retain the resulting billing session and pricing snapshot.
 func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info == nil {
+		return types.NewError(errors.New("relay info is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	if apiErr := lockRequestBillingPath(c, info); apiErr != nil {
+		return apiErr
+	}
+
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	meta := &types.TokenCountMeta{TokenType: types.TokenTypeTokenizer}
 	if info.Request != nil && (needSensitiveCheck || constant.CountToken) {
@@ -64,16 +72,66 @@ func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.N
 		logger.LogInfo(c, common.LogText("model %s is free, skipping pre-consume", info.OriginModelName))
 		return nil
 	}
+	if info.OpenRouterCostBilling {
+		return service.PrepareOpenRouterCostBilling(c, info)
+	}
 	return service.PreConsumeBilling(c, priceData.QuotaToPreConsume, info)
+}
+
+func lockRequestBillingPath(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	modeInfo := info
+	if info.ChannelMeta == nil {
+		probe := *info
+		probe.InitChannelMeta(c)
+		modeInfo = &probe
+	}
+	configured := modeInfo.OpenRouterCostBillingConfigured()
+	if info.BillingPathMode == "" {
+		if configured {
+			if !modeInfo.SupportsOpenRouterCostBillingRequest(c) {
+				return types.NewErrorWithStatusCode(
+					errors.New(i18n.T(c, i18n.MsgRelayOpenRouterCostUnsupported)),
+					types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+				)
+			}
+			info.BillingPathMode = "openrouter_cost"
+			info.OpenRouterCostBilling = true
+		} else {
+			info.BillingPathMode = "standard"
+			info.OpenRouterCostBilling = false
+		}
+	} else if (info.BillingPathMode == "openrouter_cost") != configured {
+		return types.NewErrorWithStatusCode(
+			errors.New(i18n.T(c, i18n.MsgRelayOpenRouterCostModeChanged)),
+			types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+		)
+	}
+
+	if info.OpenRouterCostBilling {
+		// Relay retry policy reads this pointer so an attempt with a generation ID
+		// can be preserved for reconciliation before another channel is selected.
+		c.Set("relay_info", info)
+		if c.GetString(common.RequestIdKey) == "" && info.RequestId != "" {
+			c.Set(common.RequestIdKey, info.RequestId)
+		}
+	}
+	return nil
 }
 
 // RefundFailedRequestBilling applies the common final-failure policy after all
 // eligible attempts have ended. A settled BillingSession never refunds again.
 func RefundFailedRequestBilling(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) *types.NewAPIError {
 	if apiErr == nil {
+		if info != nil && info.OpenRouterCostBilling && info.OpenRouterCostHeartbeatStop != nil {
+			service.FinalizeOpenRouterCostFailure(info)
+		}
 		return nil
 	}
 	apiErr = service.NormalizeViolationFeeError(apiErr)
+	if info != nil && info.OpenRouterCostBilling {
+		service.FinalizeOpenRouterCostFailure(info)
+		return apiErr
+	}
 	if info.Billing != nil {
 		info.Billing.Refund(c)
 	}
