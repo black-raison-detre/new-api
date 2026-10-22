@@ -247,6 +247,7 @@ func accessibleModelNames(c *gin.Context) ([]string, modelListGroups, error) {
 		}
 	}
 	models := service.GetGroupsEnabledModels(ownerGroups)
+	var returnedCostModels map[string]bool
 	for _, modelName := range models {
 		if modelLimitEnable {
 			matchingName := ratio_setting.RoutingMatchModelName(modelName)
@@ -255,7 +256,15 @@ func accessibleModelNames(c *gin.Context) ([]string, modelListGroups, error) {
 			}
 		}
 		if !acceptUnsetRatioModel && !helper.HasModelBillingConfig(modelName) {
-			continue
+			if returnedCostModels == nil {
+				returnedCostModels, err = model.GetOpenRouterCostOnlyModels(ownerGroups)
+				if err != nil {
+					return nil, modelListGroups{}, err
+				}
+			}
+			if !returnedCostModels[modelName] {
+				continue
+			}
 		}
 		userModelNames = append(userModelNames, modelName)
 	}

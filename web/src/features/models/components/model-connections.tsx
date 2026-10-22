@@ -45,18 +45,76 @@ export function ModelConnections(props: { model: Model }) {
               {
                 id: 'name',
                 header: t('Channel'),
-                cell: (channel) => channel.name,
+                cellClassName: 'align-top whitespace-normal',
+                cell: (channel) => (
+                  <div className='flex min-w-0 flex-col gap-1'>
+                    <span className='break-words'>{channel.name}</span>
+                    {channel.groups?.length ? (
+                      <div className='flex min-w-0 flex-wrap gap-1.5'>
+                        {channel.groups.map((group) => {
+                          const name = group.trim()
+                          return (
+                            <GroupBadge
+                              key={group}
+                              group={group}
+                              copyable={false}
+                              className='h-auto max-w-full whitespace-normal break-words'
+                            >
+                              <span className='break-words whitespace-normal'>
+                                {name === 'auto'
+                                  ? t('Auto')
+                                  : name || t('User Group')}
+                              </span>
+                            </GroupBadge>
+                          )
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                ),
               },
               {
                 id: 'type',
                 header: t('Type'),
                 cell: (channel) => channel.type,
               },
+              {
+                id: 'billing_source',
+                header: t('Billing source'),
+                cellClassName: 'align-top whitespace-normal',
+                cell: (channel) => {
+                  const isReturnedCost =
+                    channel.billing_source === 'openrouter_cost'
+                  let label = t('Unknown')
+                  if (isReturnedCost) {
+                    label = t('OpenRouter returned cost')
+                  } else if (channel.billing_source === 'local') {
+                    label = t('Local pricing')
+                  }
+
+                  return (
+                    <StatusBadge
+                      variant={isReturnedCost ? 'info' : 'neutral'}
+                      copyable={false}
+                      className='h-auto min-h-5 max-w-full whitespace-normal'
+                    >
+                      <span className='break-words whitespace-normal'>
+                        {label}
+                      </span>
+                    </StatusBadge>
+                  )
+                },
+              },
             ]}
           />
         ) : (
           <EmptyState title={t('No available channels')} />
         )}
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'OpenRouter returned-cost billing is supported for text requests and uses the final upstream USD cost multiplied by the effective group multiplier.'
+          )}
+        </p>
       </section>
       <section className='space-y-3'>
         <h3 className='font-medium'>{t('Enable Groups')}</h3>

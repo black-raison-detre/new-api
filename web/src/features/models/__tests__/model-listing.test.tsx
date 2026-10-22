@@ -123,6 +123,7 @@ async function renderList(
     waitForPricing?: boolean
     initialUrl?: string
     total?: number
+    modelDetail?: Model
   } = {}
 ) {
   useAuthStore.getState().auth.setUser({ id: 1, username: 'admin', role: 100 })
@@ -136,7 +137,9 @@ async function renderList(
       }
     }
     if (url === '/api/models/7') {
-      return { data: { success: true, data: metadata } }
+      return {
+        data: { success: true, data: options.modelDetail ?? metadata },
+      }
     }
     if (url === '/api/option/model_pricing') {
       return {
@@ -381,6 +384,100 @@ it('keeps prices and channel explanations readable in the mobile card and detail
       'No channel is configured. This model will not appear in the model square.'
     )
   ).toBeVisible()
+})
+
+it('shows channel billing sources, groups, and unknown legacy sources in connections', async () => {
+  const model: Model = {
+    ...metadata,
+    bound_channels: [
+      {
+        name: 'Local route',
+        type: 20,
+        billing_source: 'local',
+        groups: ['basic', 'priority'],
+      },
+      {
+        name: 'Returned-cost route',
+        type: 20,
+        billing_source: 'openrouter_cost',
+        groups: ['priority'],
+      },
+      { name: 'Legacy route', type: 20, groups: [] },
+    ],
+  }
+  await renderList([model], { modelDetail: model })
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: model.model_name }))
+  await user.click(screen.getByRole('tab', { name: 'Channels and groups' }))
+
+  expect(
+    screen.getByText(
+      'OpenRouter returned-cost billing is supported for text requests and uses the final upstream USD cost multiplied by the effective group multiplier.'
+    )
+  ).toBeVisible()
+  const localRow = screen.getByText('Local route').closest('tr')
+  if (!localRow) throw new Error('Expected the local channel row to render')
+  expect(within(localRow).getByText('Local pricing')).toBeVisible()
+  expect(within(localRow).getByText('basic')).toBeVisible()
+  expect(within(localRow).getByText('priority')).toBeVisible()
+
+  const returnedRow = screen.getByText('Returned-cost route').closest('tr')
+  if (!returnedRow) {
+    throw new Error('Expected the returned-cost channel row to render')
+  }
+  const returnedSource = within(returnedRow).getByText(
+    'OpenRouter returned cost'
+  )
+  expect(returnedSource).toBeVisible()
+  expect(returnedSource).toHaveClass('break-words', 'whitespace-normal')
+  const returnedBadge = returnedSource.closest('[data-slot="status-badge"]')
+  if (!returnedBadge) throw new Error('Expected a billing source status badge')
+  expect(returnedBadge).toHaveClass('text-info')
+  expect(within(returnedRow).getByText('priority')).toBeVisible()
+
+  const legacyRow = screen.getByText('Legacy route').closest('tr')
+  if (!legacyRow) throw new Error('Expected the legacy channel row to render')
+  expect(within(legacyRow).getByText('Unknown')).toBeVisible()
+})
+
+it('explains local pricing requirements for mixed returned-cost routes', async () => {
+  const pricingGuidance =
+    'Local pricing applies to local-billed channels. Supported text requests on OpenRouter returned-cost channels use the final USD cost multiplied by the effective group multiplier. Models need local pricing when their available routes mix billing sources. Change the source in channel settings.'
+  const model: Model = {
+    ...metadata,
+    bound_channels: [
+      { name: 'Local route', type: 20, billing_source: 'local', groups: [] },
+      {
+        name: 'Returned-cost route',
+        type: 20,
+        billing_source: 'openrouter_cost',
+        groups: [],
+      },
+    ],
+  }
+  await renderList([model], { modelDetail: model })
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: model.model_name }))
+  await user.click(screen.getByRole('tab', { name: 'Pricing' }))
+
+  expect(screen.getByText(pricingGuidance)).toBeVisible()
+})
+
+it('hides returned-cost pricing guidance for local-only routes', async () => {
+  const pricingGuidance =
+    'Local pricing applies to local-billed channels. Supported text requests on OpenRouter returned-cost channels use the final USD cost multiplied by the effective group multiplier. Models need local pricing when their available routes mix billing sources. Change the source in channel settings.'
+  const model: Model = {
+    ...metadata,
+    bound_channels: [
+      { name: 'Local route', type: 20, billing_source: 'local', groups: [] },
+    ],
+  }
+  await renderList([model], { modelDetail: model })
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: model.model_name }))
+  await user.click(screen.getByRole('tab', { name: 'Pricing' }))
+
+  expect(screen.queryByText(pricingGuidance)).not.toBeInTheDocument()
 })
 
 it('uses backend square states for success, warning, hidden, and partial rows including models without metadata', async () => {

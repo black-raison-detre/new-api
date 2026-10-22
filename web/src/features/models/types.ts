@@ -28,6 +28,8 @@ import { z } from 'zod'
 export interface BoundChannel {
   name: string
   type: number
+  billing_source?: 'local' | 'openrouter_cost'
+  groups?: string[]
 }
 
 /**

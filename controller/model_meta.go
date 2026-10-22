@@ -2,6 +2,7 @@ package controller
 
 import (
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -290,7 +291,14 @@ func enrichModels(models []*model.Model) error {
 			}
 			names[name] = true
 			groups[connection.Group] = true
-			channels[connection.ChannelId] = model.BoundChannel{Name: connection.ChannelName, Type: connection.ChannelType}
+			channel := channels[connection.ChannelId]
+			channel.Name = connection.ChannelName
+			channel.Type = connection.ChannelType
+			channel.BillingSource = connection.BillingSource
+			if !slices.Contains(channel.Groups, connection.Group) {
+				channel.Groups = append(channel.Groups, connection.Group)
+			}
+			channels[connection.ChannelId] = channel
 			for _, endpoint := range model.GetModelSupportEndpointTypes(name) {
 				endpoints[string(endpoint)] = true
 			}
@@ -304,6 +312,7 @@ func enrichModels(models []*model.Model) error {
 		metadata.QuotaTypes = nil
 		metadata.MatchedModels = nil
 		for _, channel := range channels {
+			slices.Sort(channel.Groups)
 			metadata.BoundChannels = append(metadata.BoundChannels, channel)
 		}
 		sort.Slice(metadata.BoundChannels, func(i, j int) bool {

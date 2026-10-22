@@ -145,6 +145,11 @@ export function ModelMutateDrawer(props: {
     enabled: props.open && isEditing,
   })
   const savedModel = modelQuery.data ?? currentRow
+  const hasOpenRouterReturnedCostChannel = Boolean(
+    savedModel?.bound_channels?.some(
+      (channel) => channel.billing_source === 'openrouter_cost'
+    )
+  )
 
   useEffect(() => {
     if (!props.open) return
@@ -663,19 +668,28 @@ export function ModelMutateDrawer(props: {
                 </div>
               )}
               {(savedModel.name_rule === 0 || pricingName) && (
-                <ModelPricingPanel
-                  onDirtyChange={setPricingDirty}
-                  key={
-                    savedModel.name_rule === 0
-                      ? savedModel.model_name
-                      : pricingName
-                  }
-                  modelName={
-                    savedModel.name_rule === 0
-                      ? savedModel.model_name
-                      : pricingName
-                  }
-                />
+                <>
+                  {hasOpenRouterReturnedCostChannel && (
+                    <p className='text-muted-foreground px-4 pb-3 text-sm'>
+                      {t(
+                        'Local pricing applies to local-billed channels. Supported text requests on OpenRouter returned-cost channels use the final USD cost multiplied by the effective group multiplier. Models need local pricing when their available routes mix billing sources. Change the source in channel settings.'
+                      )}
+                    </p>
+                  )}
+                  <ModelPricingPanel
+                    onDirtyChange={setPricingDirty}
+                    key={
+                      savedModel.name_rule === 0
+                        ? savedModel.model_name
+                        : pricingName
+                    }
+                    modelName={
+                      savedModel.name_rule === 0
+                        ? savedModel.model_name
+                        : pricingName
+                    }
+                  />
+                </>
               )}
             </div>
           )}

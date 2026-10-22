@@ -674,7 +674,56 @@ format; retain new-api's authorization, validation, billing, and logging control
   fingerprint `ede71b542d584155a6af33a445268a1912e75b02` with no actionable findings.
   Whitespace checks passed.
 
+### Returned-cost discovery and administration follow-up (2026-10-22)
+
+- [x] Discover models without local prices when every route available to the
+  requesting groups uses standard OpenRouter returned-cost billing and has an
+  enabled credential. Preserve token model restrictions, effective Auto groups,
+  and each group's exact-name/normalized-name routing precedence. Mixed local
+  and returned-cost routes retain the local-price requirement. Existing priced
+  models and the wallet/subscription settlement path are unchanged.
+- [x] Add read-only billing source and channel-specific groups to model
+  administration. Explain returned-cost billing beside local pricing; keep the
+  billing-source selector in the channel editor. Translate the copy in all seven
+  locales. No database schema, price entry, or billing mode is added.
+- [x] Extend the existing model-list regression suite with returned-cost-only,
+  local/mixed/enterprise, missing or disabled keys, disabled routes, token and
+  Auto-group filtering, model-name fallback, source changes, and polling-cursor
+  preservation. Verify source/group metadata without exposing channel secrets.
+- [x] Real database checks passed without skips on SQLite 3.50.4, MySQL 8.0.46,
+  and PostgreSQL 15.19, with the channel cache enabled and disabled. Command:
+  `python3 /private/tmp/new-api-returned-discovery-matrix.py`; the wrapper runs
+  `go test -v -p 2 ./controller ./model -run '^(TestReturnedCostModelDiscoveryDatabaseMatrix|TestListModels.*|TestGetUserModels.*|TestModelManagementDatabaseMatrix|TestPricingOpenRouterEndpointTypesDatabaseMatrix)$' -count=1 -timeout=8m`
+  against isolated databases, then removes its containers and credentials.
+  Evidence: `/private/tmp/new-api-returned-discovery/matrix.log`.
+- [x] Frontend model-listing tests passed (28 cases), followed by
+  `bun run typecheck`, oxlint on the four changed TypeScript/TSX files,
+  `bun run i18n:sync`, and `bun run build`. Evidence:
+  `/private/tmp/new-api-returned-discovery-web-{tests,typecheck,lint,build}.log`.
+- [x] Independent working-tree review approved the fixes for per-group model-name
+  fallback and a cached-channel polling-cursor read race. This is not staged
+  review or commit approval. No race-detector run, live OpenRouter inference, or
+  full `go test ./...` run was performed for this follow-up.
+- [x] Inspect the rendered desktop/mobile channel-source and pricing states.
+  Local Chromium with mocked management APIs verified per-channel sources and
+  groups, keyboard pricing-tab navigation, mixed/returned-cost-only/local-only
+  guidance, and contained drawer width. Visual review approved the additions.
+  Command:
+  `python3 /private/tmp/new-api-openrouter-cost-browser-runner.py /private/tmp/new-api-returned-discovery-ui.mjs`.
+  Evidence: `/private/tmp/new-api-returned-discovery-ui.log` and
+  `/private/tmp/new-api-returned-discovery-*-{connections,pricing}.png`.
+  The existing mobile local-pricing mode tabs have crowded legacy labels in
+  both local-only and returned-cost screenshots; that separate editor layout
+  was not changed in this follow-up.
+- Authorization scope: existing group and token restrictions remain server-side
+  and fail closed for unpriced mixed routes, following the
+  [OWASP Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
+  Authentication/session flows and credential-management endpoints are unchanged.
+
 ## Phase 3: Pricing import through the existing UI
+
+Deferred at the user's request; returned-cost discovery above is independent of
+catalog-price import.
 
 - [ ] Extend the existing pricing-sync preview and save flow rather than replacing
   it. Preserve response contracts, conflict checks, and administrator overrides.
