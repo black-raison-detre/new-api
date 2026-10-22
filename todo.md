@@ -2,8 +2,9 @@
 
 Recorded: 2026-10-21. Assessment baseline: `6cf0d90b5` on
 `v1.0.0-rc.45-custom`. The dedicated adaptor, native Messages, returned-cost
-billing, and per-model routing are implemented. Richer catalog/pricing imports,
-remaining capability work, and live routing-affinity validation are pending.
+billing, per-model routing, endpoint metadata, and provider-option preservation
+are implemented. Richer catalog/pricing imports, authorized cross-model fallback,
+and live routing-affinity validation are pending.
 
 ## Goal
 
@@ -53,15 +54,18 @@ format; retain new-api's authorization, validation, billing, and logging control
   effective group multiplier and retain existing currency display conversion.
 - [x] Add per-model Standard/Nitro/Floor routing, exact provider locks, provider
   discovery, and user/conversation affinity in the existing channel editor.
-- [ ] Preserve documented OpenRouter routing fields without requiring blanket
+- [x] Preserve documented OpenRouter provider routing fields without requiring blanket
   body passthrough. Define precedence between client options and administrator
   policy; preserve explicit zero and false values.
-- [ ] Enforce authorization and valid pricing for every model allowed through
-  multi-model fallback options before forwarding them.
-- [ ] Retain request bounds, parameter overrides, reservations, settlement,
-  refunds, and audit behavior across the new paths.
-- [ ] Correct advertised endpoint capabilities to match verified runtime support.
-- [ ] Check OpenRouter streaming usage support and update the stream-support
+- [x] Reject cross-model fallback and opaque model selectors before billing and
+  again after outbound overrides, including unconfigured and passthrough paths.
+- [ ] Enable cross-model fallback only after enforcing authorization and valid
+  pricing for every candidate and settling against the actual selected model or
+  authoritative returned cost. Provider failover within one model is supported.
+- [x] Retain request bounds, parameter overrides, reservations, settlement,
+  refunds, and audit behavior across the implemented single-model paths.
+- [x] Correct advertised endpoint capabilities to match verified runtime support.
+- [x] Check OpenRouter streaming usage support and update the stream-support
   configuration without changing unrelated adaptors.
 
 ### Dedicated adaptor foundation
@@ -468,6 +472,77 @@ format; retain new-api's authorization, validation, billing, and logging control
 - Removed the two isolated database containers and their temporary credentials;
   restored the previously stopped Colima VM to stopped. Existing images and the
   user's build container were retained.
+
+### Phase 1 capability and routing safeguards (2026-10-22)
+
+- OpenRouter endpoint metadata now advertises Chat and Responses. Pricing/model
+  metadata also includes Anthropic Messages when at least one enabled channel
+  for that model opts into native Messages and is not enterprise. Channel-cache
+  updates invalidate the metadata when the setting changes. No schema changed.
+- Public OpenRouter channels retain Chat `stream_options` through both channel
+  initialization and the shared OpenAI converter. Converted Claude/Gemini
+  streams request usage; native Messages and enterprise behavior are preserved.
+  OpenRouter's current [usage accounting documentation](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
+  says usage is automatic and the legacy inclusion parameters have no effect;
+  they are retained for request compatibility, not relied on for accounting.
+- Raw `provider` options survive typed request serialization for Chat, legacy
+  Completions, Responses, native Messages, and converted Claude/Gemini requests.
+  Explicit zero/false provider values remain present. Administrator outbound
+  preferences take precedence; configured model/provider policies remain final.
+  Client/admin allowlists intersect, denylists combine, and privacy/parameter
+  requirements cannot be loosened. Conflicting unsupported restrictions reject
+  instead of silently relaxing a price cap or other condition.
+- Provider failover stays available within the authorized model. Cross-model
+  lists, presets, remote routers, and other opaque selectors are rejected with
+  a non-retryable 400 before pricing/reservation and checked again at the final
+  outbound boundary. These checks also cover passthrough, legacy Completions,
+  non-JSON content-type headers, and arbitrary `Upgrade` headers. Unconfigured
+  same-model `:exacto` requests retain their existing behavior. Full cross-model
+  fallback support remains explicitly open above; this milestone does not add it.
+- Regression tests extend existing suites and verify provider preservation,
+  restrictive override precedence, pre-reservation rejection, no unsafe upstream
+  forwarding, streaming conversion, native/enterprise capability selection,
+  shared-model capability union, and settings invalidation with/without cache.
+- Metadata database verification passed without skips on SQLite 3.50.4,
+  MySQL 8.0.46, and PostgreSQL 15.19, using isolated databases. The matrix exercises
+  real channel storage, cache/database settings reads, capability aggregation,
+  and setting removal. This change adds no migration or settlement behavior.
+- Independent working-tree review approved the final nine code/test files after
+  fixing legacy Completions coverage, the Upgrade-header bypass, and same-model
+  Exacto compatibility. This initial review is separate from the staged review
+  required before committing.
+- Security applicability review consulted OWASP ASVS 5.0.0 authorization controls
+  8.2.1, 8.2.2, and 8.3.1, the
+  [Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html),
+  [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html),
+  and [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html).
+  Opaque selection is denied at the trusted gateway boundary; existing user/model
+  authorization remains authoritative. This is an applicability assessment,
+  not an ASVS compliance claim.
+- Validation commands (root, external DSNs must point to disposable databases):
+
+  ```sh
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./common ./model ./relay/channel/openrouter ./relay/channel/openai ./relay/common ./relay ./service -run 'OpenRouter|Pricing.*Endpoint|PricingOpenRouter|NativeMessages|ChatCompletionsViaResponses' -count=1 -timeout=3m
+  TEST_MYSQL_DSN='<isolated MySQL DSN>' TEST_POSTGRES_DSN='<isolated PostgreSQL URL DSN>' GOCACHE=/private/tmp/new-api-openrouter-gocache go test -v -p 2 ./model -run '^TestPricingOpenRouterEndpointTypesDatabaseMatrix$' -count=1 -timeout=3m
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./... -count=1 -timeout=3m
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./... -count=1 -timeout=3m -skip '^TestAdaptorMasksDialedHostsInDialFailure$/^channel_proxy_host$'
+  ```
+
+- The initial focused seven-package run passed. Strict root `go test ./...`
+  failed only the previously recorded release-baseline
+  `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` case. The final
+  post-review root suite passed with only that exact subcase explicitly excluded;
+  this is not an unmodified suite pass. Environment-gated tests retain their
+  existing skips; the dedicated metadata database matrix had no skips.
+  No `relaykit`/`tokenkit` source or frontend changed. No live OpenRouter call or
+  production acceptance was verified. Local logs are
+  `/private/tmp/new-api-phase1-focused.log`,
+  `/private/tmp/new-api-phase1-db-matrix.log`,
+  `/private/tmp/new-api-phase1-full-go.log`, and
+  `/private/tmp/new-api-phase1-full-go-final.log`.
+- Removed the temporary MySQL/PostgreSQL containers, their volumes, and temporary
+  credentials, then restored the previously stopped Colima VM to stopped. Existing
+  images and the user's build container were retained.
 
 ## Phase 2: Catalog and provider metadata
 

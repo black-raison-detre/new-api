@@ -182,6 +182,41 @@ func loadPricingAdvancedCustomConfigs(enableAbilities []AbilityWithChannel) map[
 	return configs
 }
 
+func loadPricingOpenRouterNativeMessages(enableAbilities []AbilityWithChannel) map[int]bool {
+	seen := make(map[int]struct{})
+	nativeMessages := make(map[int]bool)
+	for _, ability := range enableAbilities {
+		if ability.ChannelType != constant.ChannelTypeOpenRouter {
+			continue
+		}
+		if _, exists := seen[ability.ChannelId]; exists {
+			continue
+		}
+		seen[ability.ChannelId] = struct{}{}
+		channel, err := CacheGetChannel(ability.ChannelId)
+		if err != nil {
+			common.SysLog(common.LogText("load OpenRouter channel settings error: channel_id=%d, error=%v", ability.ChannelId, err))
+			continue
+		}
+		if channel.Type != constant.ChannelTypeOpenRouter || channel.OtherSettings == "" {
+			continue
+		}
+
+		settings := dto.ChannelOtherSettings{}
+		if err := common.UnmarshalJsonStr(channel.OtherSettings, &settings); err != nil {
+			common.SysLog(common.LogText("decode OpenRouter channel settings error: channel_id=%d, error=%v", ability.ChannelId, err))
+			continue
+		}
+		if settings.OpenRouterNativeMessages && !settings.IsOpenRouterEnterprise() {
+			nativeMessages[ability.ChannelId] = true
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	return nativeMessages
+}
+
 func appendPricingEndpoint(endpoints []string, endpoint string) []string {
 	if endpoint == "" || common.StringsContains(endpoints, endpoint) {
 		return endpoints
@@ -241,11 +276,15 @@ func updatePricing() {
 	//这里使用切片而不是Set，因为一个模型可能支持多个端点类型，并且第一个端点是优先使用端点
 	modelSupportEndpointsStr := make(map[string][]string)
 	advancedCustomConfigs := loadPricingAdvancedCustomConfigs(enableAbilities)
+	openRouterNativeMessages := loadPricingOpenRouterNativeMessages(enableAbilities)
 
 	// 先根据已有能力填充原生端点
 	for _, ability := range enableAbilities {
 		endpoints := modelSupportEndpointsStr[ability.Model]
 		channelTypes := getPricingEndpointTypesForAbility(ability, advancedCustomConfigs)
+		if openRouterNativeMessages[ability.ChannelId] {
+			channelTypes = append(channelTypes, constant.EndpointTypeAnthropic)
+		}
 		for _, channelType := range channelTypes {
 			if !common.StringsContains(endpoints, string(channelType)) {
 				endpoints = append(endpoints, string(channelType))

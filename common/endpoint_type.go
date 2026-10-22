@@ -31,8 +31,8 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 		fallthrough
 	case constant.ChannelTypeGemini:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}
-	case constant.ChannelTypeOpenRouter: // OpenRouter 只支持 OpenAI 端点
-		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
+	case constant.ChannelTypeOpenRouter:
+		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeXai:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeVLLM, constant.ChannelTypeSGLang:

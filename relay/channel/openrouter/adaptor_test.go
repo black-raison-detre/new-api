@@ -470,6 +470,203 @@ func TestConfiguredOpenRouterProviderPolicyPreservesRestrictions(t *testing.T) {
 	assert.NotContains(t, provider, "sort")
 }
 
+func TestOpenRouterPreservesProviderOptionsWithoutModelPolicy(t *testing.T) {
+	service.InitHttpClient()
+	provider := `{"order":["google-vertex/us-east5"],"sort":"price","only":["google-vertex"],"ignore":["blocked"],"allow_fallbacks":false,"require_parameters":false,"zdr":false,"data_collection":"allow","max_price":{"prompt":0,"completion":0},"preferred_min_throughput":0}`
+	for _, tc := range []struct {
+		name   string
+		format types.RelayFormat
+		mode   int
+		path   string
+		native bool
+		exacto bool
+	}{
+		{"Chat", types.RelayFormatOpenAI, relayconstant.RelayModeChatCompletions, "/v1/chat/completions", false, false},
+		{"Completions", types.RelayFormatOpenAI, relayconstant.RelayModeCompletions, "/v1/completions", false, false},
+		{"Responses", types.RelayFormatOpenAIResponses, relayconstant.RelayModeResponses, "/v1/responses", false, false},
+		{"native Messages", types.RelayFormatClaude, relayconstant.RelayModeChatCompletions, "/v1/messages", true, false},
+		{"converted Messages", types.RelayFormatClaude, relayconstant.RelayModeChatCompletions, "/v1/messages", false, false},
+		{"converted Gemini", types.RelayFormatGemini, relayconstant.RelayModeGemini, "/v1beta/models/alias:generateContent", false, false},
+		{"same-model Exacto", types.RelayFormatOpenAI, relayconstant.RelayModeChatCompletions, "/v1/chat/completions", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer server.Close()
+			upstreamModel := "vendor/model"
+			if tc.exacto {
+				upstreamModel += ":exacto"
+			}
+			original := `{"model":"` + upstreamModel + `","provider":` + provider + `}`
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(original))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Header.Set("Upgrade", "websocket")
+			info := &relaycommon.RelayInfo{
+				RelayFormat: tc.format, RelayMode: tc.mode, RequestURLPath: tc.path, OriginModelName: "alias",
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, UpstreamModelName: upstreamModel,
+					ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterNativeMessages: tc.native},
+				},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			// Typed conversion drops unknown provider options; restore only routing
+			// metadata, keeping the validated and mapped final request intact.
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"`+upstreamModel+`","messages":[],"max_tokens":32,"temperature":0,"stream":false}`))
+			require.NoError(t, err)
+			require.NoError(t, response.(*http.Response).Body.Close())
+			var outbound map[string]json.RawMessage
+			require.NoError(t, common.Unmarshal(gotBody, &outbound))
+			assert.JSONEq(t, provider, string(outbound["provider"]))
+			assert.JSONEq(t, `"`+upstreamModel+`"`, string(outbound["model"]))
+			assert.JSONEq(t, `32`, string(outbound["max_tokens"]))
+			assert.JSONEq(t, `0`, string(outbound["temperature"]))
+			assert.JSONEq(t, `false`, string(outbound["stream"]))
+		})
+	}
+}
+
+func TestOpenRouterUnconfiguredProviderOverridePrecedence(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name     string
+		original string
+		final    string
+		want     string
+	}{
+		{
+			name:     "administrator order wins and restrictions intersect",
+			original: `{"order":["client"],"only":["google-vertex","other"],"ignore":["blocked"],"zdr":true,"require_parameters":true,"data_collection":"deny","allow_fallbacks":false}`,
+			final:    `{"order":["admin"],"only":["google-vertex/us-east5"],"ignore":["admin-blocked"],"zdr":false,"require_parameters":false,"data_collection":"allow","allow_fallbacks":true}`,
+			want:     `{"order":["admin"],"only":["google-vertex/us-east5"],"ignore":["blocked","admin-blocked"],"zdr":true,"require_parameters":true,"data_collection":"deny","allow_fallbacks":false}`,
+		},
+		{
+			name:     "provider failover true stays explicit",
+			original: `{"allow_fallbacks":true}`,
+			final:    `{"sort":"throughput"}`,
+			want:     `{"allow_fallbacks":true,"sort":"throughput"}`,
+		},
+		{
+			name:     "disjoint allowlists reject",
+			original: `{"only":["google"]}`,
+			final:    `{"only":["deepinfra"]}`,
+		},
+		{
+			name:     "conflicting price caps reject rather than relax",
+			original: `{"max_price":{"prompt":0}}`,
+			final:    `{"max_price":{"prompt":1}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBody, _ = io.ReadAll(r.Body)
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer server.Close()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","provider":`+tc.original+`}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			info := &relaycommon.RelayInfo{
+				RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions, OriginModelName: "alias",
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, UpstreamModelName: "vendor/model"},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"vendor/model","provider":`+tc.final+`}`))
+			if tc.want == "" {
+				require.Error(t, err)
+				assert.Empty(t, gotBody, "conflicting restrictions must not reach upstream")
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, response.(*http.Response).Body.Close())
+			var outbound map[string]json.RawMessage
+			require.NoError(t, common.Unmarshal(gotBody, &outbound))
+			assert.JSONEq(t, tc.want, string(outbound["provider"]))
+		})
+	}
+}
+
+func TestOpenRouterRejectsCrossModelRoutingBeforeBillingAndForwarding(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name        string
+		body        string
+		completions bool
+	}{
+		{"model list", `{"model":"alias","models":["unpriced-model"]}`, false},
+		{"legacy Completions model list", `{"model":"alias","models":["unpriced-model"]}`, true},
+		{"fallback list", `{"model":"alias","fallbacks":["unauthorized-model"]}`, false},
+		{"preset", `{"model":"alias","preset":"opaque-preset"}`, false},
+		{"route", `{"model":"alias","route":"fallback"}`, false},
+		{"router", `{"model":"alias","router":"opaque-router"}`, false},
+		{"model router", `{"model":"alias","model_router":"opaque-router"}`, false},
+		{"remote model", `{"model":"openrouter/auto"}`, false},
+		{"preset model", `{"model":"@preset/opaque-preset"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode, path := relayconstant.RelayModeChatCompletions, "/v1/chat/completions"
+			if tc.completions {
+				mode, path = relayconstant.RelayModeCompletions, "/v1/completions"
+			}
+			for _, billingMode := range []string{"standard", "returned-cost"} {
+				t.Run(billingMode, func(t *testing.T) {
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(tc.body))
+					c.Request.Header.Set("Content-Type", "text/plain")
+					info := &relaycommon.RelayInfo{
+						RelayFormat: types.RelayFormatOpenAI, RelayMode: mode, OriginModelName: "alias",
+						ChannelMeta: &relaycommon.ChannelMeta{
+							ChannelType:          constant.ChannelTypeOpenRouter,
+							ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterCostBilling: billingMode == "returned-cost"},
+						},
+					}
+					// No database or account fixture: rejection must happen before any
+					// pricing lookup, wallet/subscription reservation or cost ledger.
+					apiErr := relay.PrepareRequestBilling(c, info)
+					require.NotNil(t, apiErr)
+					assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+					assert.True(t, types.IsSkipRetryError(apiErr))
+					assert.Empty(t, info.BillingPathMode)
+					assert.Nil(t, info.Billing)
+					assert.Zero(t, info.FinalPreConsumedQuota)
+				})
+			}
+			for _, source := range []string{"original", "final override"} {
+				t.Run(source, func(t *testing.T) {
+					forwarded := false
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forwarded = true }))
+					defer server.Close()
+					original, final := tc.body, `{"model":"vendor/model"}`
+					if source == "final override" {
+						original, final = `{"model":"alias"}`, tc.body
+					}
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(original))
+					c.Request.Header.Set("Content-Type", "text/plain")
+					c.Request.Header.Set("Upgrade", "websocket")
+					info := &relaycommon.RelayInfo{
+						RelayFormat: types.RelayFormatOpenAI, RelayMode: mode, OriginModelName: "alias",
+						ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, UpstreamModelName: "vendor/model"},
+					}
+					adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+					adaptor.Init(info)
+					_, err := adaptor.DoRequest(c, info, strings.NewReader(final))
+					require.Error(t, err)
+					assert.False(t, forwarded)
+				})
+			}
+		})
+	}
+}
+
 func TestConfiguredOpenRouterPolicyRejectsBypassAndInvalidSessionBeforeForwarding(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	service.InitHttpClient()
@@ -1030,6 +1227,67 @@ func TestAdaptorPreservesOpenRouterReasoningAndUsageRequest(t *testing.T) {
 	assert.Empty(t, request.ReasoningEffort)
 	assert.JSONEq(t, `{"enabled":true,"effort":"high"}`, string(request.Reasoning))
 	assert.JSONEq(t, `{"include":true}`, string(request.Usage))
+}
+
+func TestOpenRouterStreamingOptionsAcrossRequestFormats(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		format     types.RelayFormat
+		native     bool
+		enterprise bool
+	}{
+		{"Chat", types.RelayFormatOpenAI, false, false},
+		{"converted Messages", types.RelayFormatClaude, false, false},
+		{"converted Gemini", types.RelayFormatGemini, false, false},
+		{"native Messages", types.RelayFormatClaude, true, false},
+		{"enterprise Messages", types.RelayFormatClaude, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenRouter)
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{
+				OpenRouterNativeMessages: tc.native, OpenRouterEnterprise: common.GetPointer(tc.enterprise),
+			})
+			info := &relaycommon.RelayInfo{RelayFormat: tc.format, RelayMode: relayconstant.RelayModeChatCompletions, IsStream: true}
+			info.InitChannelMeta(c)
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			var converted any
+			var err error
+			switch tc.format {
+			case types.RelayFormatOpenAI:
+				converted, err = adaptor.ConvertOpenAIRequest(c, info, &dto.GeneralOpenAIRequest{
+					Model: "vendor/model", Stream: common.GetPointer(true), StreamOptions: &dto.StreamOptions{IncludeUsage: false},
+				})
+			case types.RelayFormatClaude:
+				request := &dto.ClaudeRequest{}
+				require.NoError(t, common.UnmarshalJsonStr(`{"model":"vendor/model","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]}`, request))
+				converted, err = adaptor.ConvertClaudeRequest(c, info, request)
+			case types.RelayFormatGemini:
+				request := &dto.GeminiChatRequest{}
+				require.NoError(t, common.UnmarshalJsonStr(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`, request))
+				converted, err = adaptor.ConvertGeminiRequest(c, info, request)
+			}
+			require.NoError(t, err)
+			body, err := common.Marshal(converted)
+			require.NoError(t, err)
+			var outbound map[string]json.RawMessage
+			require.NoError(t, common.Unmarshal(body, &outbound))
+			if tc.enterprise || tc.native {
+				assert.NotContains(t, outbound, "stream_options")
+			} else {
+				require.True(t, info.SupportStreamOptions)
+				want := `{"include_usage":true}`
+				if tc.format == types.RelayFormatOpenAI {
+					// The shared StreamOptions DTO omits false; an empty options
+					// object retains the client's opt-out without forcing true.
+					want = `{}`
+				}
+				assert.JSONEq(t, want, string(outbound["stream_options"]))
+			}
+		})
+	}
 }
 
 func TestAdaptorPreservesEnterpriseAndProtocolResponses(t *testing.T) {

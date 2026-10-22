@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -84,6 +85,12 @@ func lockRequestBillingPath(c *gin.Context, info *relaycommon.RelayInfo) *types.
 		probe := *info
 		probe.InitChannelMeta(c)
 		modeInfo = &probe
+	}
+	if err := openrouter.ValidateRequestModelRouting(c, modeInfo); err != nil {
+		return types.NewErrorWithStatusCode(
+			errors.New(i18n.T(c, i18n.MsgRelayOpenRouterRoutingInvalid, nil)),
+			types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+		)
 	}
 	configured := modeInfo.OpenRouterCostBillingConfigured()
 	if info.BillingPathMode == "" {

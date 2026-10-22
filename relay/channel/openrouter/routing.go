@@ -34,6 +34,31 @@ type originalOpenRouterFields struct {
 	ModelRouter json.RawMessage `json:"model_router"`
 }
 
+// ValidateRequestModelRouting rejects opaque model selection before any quota
+// reservation. Provider failover within one model remains supported; cross-model
+// routing needs authorization and pricing for every possible model first.
+func ValidateRequestModelRouting(c *gin.Context, info *relaycommon.RelayInfo) error {
+	if info == nil || info.ChannelMeta == nil || info.ChannelType != constant.ChannelTypeOpenRouter ||
+		info.ChannelOtherSettings.IsOpenRouterEnterprise() || !supportsOpenRouterTextJSONRequest(info) {
+		return nil
+	}
+	body, err := readOriginalRequestBody(c)
+	if err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	var fields originalOpenRouterFields
+	if err := rootcommon.Unmarshal(body, &fields); err != nil {
+		return errors.New("invalid original OpenRouter request body")
+	}
+	if err := validateOpenRouterModelRoutingFields(fields); err != nil {
+		return err
+	}
+	return validateOpenRouterRoutedModel(fields.Model, false)
+}
+
 func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (routedOpenRouterBody, error) {
 	policy, configured, err := info.ResolveOpenRouterModelRouting(c)
 	if err != nil {
@@ -50,13 +75,7 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 	if configured && !supportedJSONRequest {
 		return routedOpenRouterBody{}, errors.New("OpenRouter model routing is unsupported for this request format")
 	}
-	if c == nil || c.Request == nil || c.Request.Header.Get("Upgrade") != "" {
-		if !configured {
-			return routedOpenRouterBody{}, nil
-		}
-		return routedOpenRouterBody{}, errors.New("OpenRouter model routing requires a JSON HTTP request")
-	}
-	if !strings.HasPrefix(strings.ToLower(c.Request.Header.Get("Content-Type")), "application/json") {
+	if c == nil || c.Request == nil {
 		if !configured {
 			return routedOpenRouterBody{}, nil
 		}
@@ -74,14 +93,14 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 		return routedOpenRouterBody{}, err
 	}
 	var original originalOpenRouterFields
-	if configured && len(originalBody) > 0 {
+	if len(originalBody) > 0 {
 		if err := rootcommon.Unmarshal(originalBody, &original); err != nil {
 			return routedOpenRouterBody{}, errors.New("invalid original OpenRouter request body")
 		}
 		if err := validateOpenRouterModelRoutingFields(original); err != nil {
 			return routedOpenRouterBody{}, err
 		}
-		if err := validateOpenRouterRoutedModel(original.Model); err != nil {
+		if err := validateOpenRouterRoutedModel(original.Model, configured); err != nil {
 			return routedOpenRouterBody{}, err
 		}
 	}
@@ -99,13 +118,13 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 			return routedOpenRouterBody{}, errors.New("OpenRouter model routing requires a JSON object body")
 		}
 	}
+	if err := validateOpenRouterModelRoutingFields(originalOpenRouterFieldsFromMap(fields)); err != nil {
+		return routedOpenRouterBody{}, err
+	}
+	if err := validateOpenRouterRoutedModel(fields["model"], configured); err != nil {
+		return routedOpenRouterBody{}, err
+	}
 	if configured {
-		if err := validateOpenRouterModelRoutingFields(originalOpenRouterFieldsFromMap(fields)); err != nil {
-			return routedOpenRouterBody{}, err
-		}
-		if err := validateOpenRouterRoutedModel(fields["model"]); err != nil {
-			return routedOpenRouterBody{}, err
-		}
 		modelName := info.UpstreamModelName
 		if modelName == "" {
 			modelName = info.OriginModelName
@@ -115,7 +134,7 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 		if err != nil {
 			return routedOpenRouterBody{}, errors.New("failed to encode OpenRouter model routing policy")
 		}
-		if err := validateOpenRouterRoutedModel(modelRaw); err != nil {
+		if err := validateOpenRouterRoutedModel(modelRaw, true); err != nil {
 			return routedOpenRouterBody{}, err
 		}
 		switch policy.Mode {
@@ -135,16 +154,16 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 			return routedOpenRouterBody{}, errors.New("failed to encode OpenRouter model routing policy")
 		}
 		fields["model"] = modelRaw
+	}
 
-		providerRaw, err := mergeOpenRouterProvider(original.Provider, fields["provider"], policy)
-		if err != nil {
-			return routedOpenRouterBody{}, err
-		}
-		if len(providerRaw) == 0 {
-			delete(fields, "provider")
-		} else {
-			fields["provider"] = providerRaw
-		}
+	providerRaw, err := mergeOpenRouterProvider(original.Provider, fields["provider"], policy)
+	if err != nil {
+		return routedOpenRouterBody{}, err
+	}
+	if len(providerRaw) == 0 {
+		delete(fields, "provider")
+	} else {
+		fields["provider"] = providerRaw
 	}
 
 	conversationKey, err := relaycommon.OpenRouterConversationKey(originalBody, c.Request.Header.Get("x-session-id"))
@@ -168,7 +187,7 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 			info.ApiKey,
 		)
 	}
-	if sessionID == "" && !configured {
+	if sessionID == "" && !configured && len(original.Provider) == 0 {
 		return routedOpenRouterBody{body: finalBody}, nil
 	}
 	if sessionID != "" {
@@ -186,7 +205,7 @@ func (a *Adaptor) routeConfiguredRequest(c *gin.Context, info *relaycommon.Relay
 	return routedOpenRouterBody{body: encoded, sessionID: sessionID}, nil
 }
 
-func validateOpenRouterRoutedModel(raw json.RawMessage) error {
+func validateOpenRouterRoutedModel(raw json.RawMessage, configured bool) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
 	}
@@ -199,7 +218,7 @@ func validateOpenRouterRoutedModel(raw json.RawMessage) error {
 		return errors.New("OpenRouter model routing cannot target a remote router or preset model")
 	}
 	for _, variant := range strings.Split(normalized, ":")[1:] {
-		if variant == "exacto" {
+		if configured && variant == "exacto" {
 			return errors.New("OpenRouter exacto routing is incompatible with the configured model policy")
 		}
 	}
@@ -212,7 +231,7 @@ func supportsOpenRouterTextJSONRequest(info *relaycommon.RelayInfo) bool {
 	}
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:
-		return info.RelayMode == relayconstant.RelayModeChatCompletions || info.RelayMode == relayconstant.RelayModeResponses
+		return info.RelayMode == relayconstant.RelayModeChatCompletions || info.RelayMode == relayconstant.RelayModeCompletions || info.RelayMode == relayconstant.RelayModeResponses
 	case types.RelayFormatOpenAIResponses:
 		return info.RelayMode == relayconstant.RelayModeResponses
 	case types.RelayFormatClaude:
@@ -309,8 +328,10 @@ func mergeOpenRouterProvider(originalRaw, finalRaw json.RawMessage, policy dto.O
 		}
 	}
 
-	delete(provider, "order")
-	delete(provider, "sort")
+	if policy.Mode != "" {
+		delete(provider, "order")
+		delete(provider, "sort")
+	}
 	if policy.Mode == dto.OpenRouterModelRoutingLocked {
 		only, err := openRouterProviderList(provider["only"])
 		if err != nil {
@@ -338,7 +359,7 @@ func mergeOpenRouterProvider(originalRaw, finalRaw json.RawMessage, policy dto.O
 			return nil, errors.New("failed to encode locked OpenRouter provider")
 		}
 		provider["allow_fallbacks"] = fallbackRaw
-	} else if fallbackRaw := provider["allow_fallbacks"]; len(fallbackRaw) > 0 {
+	} else if fallbackRaw := provider["allow_fallbacks"]; policy.Mode != "" && len(fallbackRaw) > 0 {
 		var allowFallbacks bool
 		if err := rootcommon.Unmarshal(fallbackRaw, &allowFallbacks); err != nil {
 			return nil, errors.New("invalid OpenRouter allow_fallbacks constraint")

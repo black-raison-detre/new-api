@@ -590,6 +590,9 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	if streamSupportedChannels[channelMeta.ChannelType] {
 		channelMeta.SupportStreamOptions = true
 	}
+	if channelType == constant.ChannelTypeOpenRouter && channelMeta.ChannelOtherSettings.IsOpenRouterEnterprise() {
+		channelMeta.SupportStreamOptions = false
+	}
 
 	info.ChannelMeta = channelMeta
 
@@ -699,7 +702,9 @@ func (info *RelayInfo) ToString() string {
 
 // 定义支持流式选项的通道类型
 var streamSupportedChannels = map[int]bool{
-	constant.ChannelTypeOpenAI:         true,
+	constant.ChannelTypeOpenAI: true,
+	// OpenRouter accepts this compatibility field; usage is now automatic.
+	constant.ChannelTypeOpenRouter:     true,
 	constant.ChannelTypeAnthropic:      true,
 	constant.ChannelTypeAws:            true,
 	constant.ChannelTypeGemini:         true,
