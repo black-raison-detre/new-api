@@ -3,8 +3,9 @@
 Recorded: 2026-10-21. Assessment baseline: `6cf0d90b5` on
 `v1.0.0-rc.45-custom`. The dedicated adaptor, native Messages, returned-cost
 billing, per-model routing, endpoint metadata, provider-option preservation, and
-the richer cached model catalog are implemented. Pricing imports, authorized
-cross-model fallback, and live routing-affinity validation are pending.
+the richer cached model catalog are implemented. Live routing and affinity passed
+the bounded gateway checks recorded below. Pricing imports remain deferred at
+the user's request. Cross-model fallback is out of scope.
 
 ## Goal
 
@@ -59,9 +60,10 @@ format; retain new-api's authorization, validation, billing, and logging control
   policy; preserve explicit zero and false values.
 - [x] Reject cross-model fallback and opaque model selectors before billing and
   again after outbound overrides, including unconfigured and passthrough paths.
-- [ ] Enable cross-model fallback only after enforcing authorization and valid
-  pricing for every candidate and settling against the actual selected model or
-  authoritative returned cost. Provider failover within one model is supported.
+- **Out of scope (user decision, 2026-10-22):** automatic cross-model fallback.
+  Keep it disabled; it is not required for the OpenRouter integration or its
+  completion criteria. Core channel retries and provider failover within one
+  model remain supported.
 - [x] Retain request bounds, parameter overrides, reservations, settlement,
   refunds, and audit behavior across the implemented single-model paths.
 - [x] Correct advertised endpoint capabilities to match verified runtime support.
@@ -498,8 +500,8 @@ format; retain new-api's authorization, validation, billing, and logging control
   a non-retryable 400 before pricing/reservation and checked again at the final
   outbound boundary. These checks also cover passthrough, legacy Completions,
   non-JSON content-type headers, and arbitrary `Upgrade` headers. Unconfigured
-  same-model `:exacto` requests retain their existing behavior. Full cross-model
-  fallback support remains explicitly open above; this milestone does not add it.
+  same-model `:exacto` requests retain their existing behavior. Cross-model
+  fallback remains out of scope as recorded above.
 - Regression tests extend existing suites and verify provider preservation,
   restrictive override precedence, pre-reservation rejection, no unsafe upstream
   forwarding, streaming conversion, native/enterprise capability selection,
@@ -544,6 +546,66 @@ format; retain new-api's authorization, validation, billing, and logging control
 - Removed the temporary MySQL/PostgreSQL containers, their volumes, and temporary
   credentials, then restored the previously stopped Colima VM to stopped. Existing
   images and the user's build container were retained.
+
+### Live routing and affinity verification (2026-10-22)
+
+- [x] Exercised the real token-authenticated relay router against OpenRouter on
+  source `5b7e0dd8460eff92c2c76a78d716ebb05d81fbbb`, using an isolated SQLite
+  gateway with two users and two channels. The supplied private key stayed
+  outside the repository; temporary gateway databases were removed after exit.
+  No production source or deployment configuration changed.
+- [x] All 13 non-streaming Chat Completions requests returned HTTP 200. Verified
+  mapped Standard, Nitro, and Floor outbound model names, matching opaque body
+  and header session IDs, and actual provider/model/router metadata. Standard
+  used SiliconFlow, Nitro used Nebius, and Floor used SiliconFlow for
+  `qwen/qwen3-30b-a3b-instruct-2507`. Repeated sessions retained their providers
+  in this sample. These are observations, not fixed provider expectations.
+- [x] Observed actual same-model provider failover inside OpenRouter: both Floor
+  requests tried DekaLLM (429), then succeeded through SiliconFlow (200), without
+  changing the model. Gateway retries were disabled. Each request still produced
+  one settled ledger and one consume log.
+- [x] Verified an exact `openai` provider lock for `openai/gpt-4.1-nano`: outbound
+  `provider.only` and `provider.order` contained only `openai`,
+  `allow_fallbacks` was false, and OpenRouter reported OpenAI on both requests.
+- [x] Verified a live gateway affinity-cache hit: the original conversation stayed
+  on channel A after channel B gained higher priority. A new conversation and a
+  second user with the same caller session selected B with distinct upstream
+  session IDs. Disabling A moved the original conversation to B. Nitro/Floor
+  repeats also hit their gateway bindings and retained their scoped session IDs.
+- [x] Verified a separate upstream prompt-cache read with a synthetic 2,607-token
+  prompt on the locked OpenAI route: the repeat reported 2,432 cached tokens.
+  Both cache requests completed and settled normally.
+- [x] All 13 returned-cost ledgers settled with costs and quota matching the
+  upstream response, and exactly one consume log per request. Aggregate reported
+  cost was USD 0.00037132, below the USD 0.01 stop limit and 16-call cap. This is
+  returned API cost evidence, not a provider invoice reconciliation.
+- [x] Focused existing routing/affinity regressions passed with the race detector
+  in `service`, `relay/channel/openrouter`, and `relay/common`.
+- Reproduction commands (root; the temporary harness reads the raw key from the
+  private regular file `/private/tmp/new-api-openrouter-api-key`):
+
+  ```sh
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -race -p 2 ./service ./relay/channel/openrouter ./relay/common -run 'OpenRouter.*(Affinity|Session|Routing)|ConfiguredOpenRouter|OpenRouterStandardMode|OpenRouterPreservesProvider|OpenRouterUnconfiguredProvider' -count=1 -timeout=5m
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go build -o /private/tmp/new-api-routing-live /private/tmp/new-api-routing-live.go
+  /private/tmp/new-api-routing-live
+  ```
+
+- All three commands exited 0. Sanitized evidence is in
+  `/private/tmp/new-api-routing-live-results.json` (mode 0600),
+  `/private/tmp/new-api-routing-live.log`,
+  `/private/tmp/new-api-routing-live-build.log`, and
+  `/private/tmp/new-api-routing-live-race.log`. Harness SHA-256:
+  `bd6b97ba5d87f74f777d67b5270f2d2680244c385c0e11c3a800e9ca29941495`.
+- Proof limits: both channels used the same supplied upstream key, so distinct
+  upstream-account affinity was not exercised. This run used the in-memory
+  affinity cache and SQLite, not Redis, MySQL/PostgreSQL, deployed gateway
+  authentication, streaming, Responses, or native Messages. Full `go test ./...`
+  was not rerun. The earlier database/protocol verification remains separate.
+  The live observations do not establish universal Nitro/Floor versus affinity
+  precedence or guarantee future provider selection; OpenRouter's
+  [routing metadata](https://openrouter.ai/docs/guides/features/router-metadata)
+  and [prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching)
+  documentation define the upstream evidence and best-effort session behavior.
 
 ## Phase 2: Catalog and provider metadata
 
@@ -760,6 +822,37 @@ catalog-price import.
 - [x] Exercise authenticated upstream inference for affected formats when test
   credentials are available. Report live-test blockers and proof boundaries.
 - [x] Obtain independent review before any requested behavioral-change commit.
+
+### Remaining validation follow-up (2026-10-22)
+
+Prioritize the first two checks before treating the implemented integration as
+fully validated. Redis and multiple-credential checks apply when those features
+are used in the deployment; the latest live run used in-memory affinity and one
+real upstream key.
+
+- [ ] Live protocol and streaming coverage: exercise Responses and native
+  Anthropic Messages in JSON and SSE modes with Standard/Nitro/Floor and locked
+  provider policies. Verify mapped models, provider constraints, scoped session
+  IDs, complete responses, and returned-cost settlement/logging. The latest live
+  routing run covered non-streaming Chat Completions only.
+- [ ] Failure and interrupted-stream accounting: cover client cancellation,
+  upstream timeouts/errors, missing final usage, and interruption after a
+  generation ID is acquired. Verify the appropriate pending/recovery/refund
+  behavior and repeat recovery to prove no duplicate charges or consume logs.
+  Preserve billing for upstream work already incurred.
+- [ ] Redis deployment coverage: exercise affinity through two gateway instances
+  sharing Redis and across an instance restart. Verify shared binding reuse,
+  expiry, user/session isolation, and invalidation after channel or credential
+  changes; do not infer Redis behavior from the in-memory test.
+- [ ] Multiple upstream credentials: with distinct real credentials/accounts,
+  verify conversation-to-credential affinity, retry release, and recovery after
+  disabling, removing, or rotating the preferred credential. Confirm disabled
+  credentials are not reused and new accounts receive distinct session scopes.
+- [ ] Run strict `go test ./...` on the final source and record its source hash,
+  exact command, result, and environment-dependent skips. If the known release-
+  baseline `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` failure
+  recurs, report it separately. Label any rerun excluding that exact subtest
+  explicitly; do not present it as an unmodified full-suite pass.
 
 ### Precommit verification (2026-10-21)
 
