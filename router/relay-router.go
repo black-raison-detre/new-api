@@ -22,6 +22,7 @@ func SetRelayRouter(router *gin.Engine) {
 	modelsRouter.Use(middleware.RouteTag("relay"))
 	modelsRouter.Use(middleware.TokenAuth())
 	{
+		modelsRouter.GET("/metadata/openrouter", controller.ListOpenRouterModelMetadata)
 		modelsRouter.GET("", func(c *gin.Context) {
 			switch {
 			case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":

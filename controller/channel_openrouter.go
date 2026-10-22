@@ -21,6 +21,8 @@ const (
 	openRouterEndpointRequestMaxBytes  = 128 << 10
 	openRouterEndpointResponseMaxBytes = 2 << 20
 	openRouterEndpointResponseMaxRows  = 512
+	openRouterModelResponseMaxBytes    = 16 << 20
+	openRouterModelResponseMaxRows     = 8192
 )
 
 type openRouterEndpointDiscoveryRequest struct {
@@ -35,12 +37,109 @@ type openRouterEndpointDiscoveryRequest struct {
 
 type openRouterEndpointAPIResponse struct {
 	Data *struct {
-		Endpoints *[]struct {
-			Name         string `json:"name"`
-			ProviderName string `json:"provider_name"`
-			Tag          string `json:"tag"`
-		} `json:"endpoints"`
+		Endpoints *[]common.RawMessage `json:"endpoints"`
 	} `json:"data"`
+}
+
+type openRouterCatalogDiscoveryRequest struct {
+	openRouterEndpointDiscoveryRequest
+	Scope string `json:"scope"`
+}
+
+// FetchOpenRouterCatalog previews discovery without changing channel models or
+// local prices. Account scope applies upstream preferences, not local access.
+func FetchOpenRouterCatalog(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, openRouterEndpointRequestMaxBytes)
+	var req openRouterCatalogDiscoveryRequest
+	if err := c.ShouldBindJSON(&req); err != nil || !validOpenRouterDiscoveryConnection(req.openRouterEndpointDiscoveryRequest) {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid request"))
+		return
+	}
+	if req.Scope == "" {
+		req.Scope = "public"
+	}
+	if (req.Scope != "public" && req.Scope != "account") || (req.Type != nil && *req.Type != constant.ChannelTypeOpenRouter) {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid request"))
+		return
+	}
+	channel, err := buildOpenRouterEndpointPreviewChannel(req.openRouterEndpointDiscoveryRequest)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errOpenRouterChannelNotFound) {
+			status = http.StatusNotFound
+		}
+		common.ApiErrorStatus(c, status, common.NewMessage("Invalid request"))
+		return
+	}
+	key := ""
+	if req.Scope == "account" || req.Key != nil || req.ChannelID != nil {
+		key, err = openRouterEndpointAPIKey(channel, req.Key)
+		if err != nil || (req.Scope == "account" && key == "") {
+			common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid request"))
+			return
+		}
+	}
+	baseURL := strings.TrimSpace(channel.GetBaseURL())
+	if baseURL == "" {
+		baseURL = constant.GetChannelBaseURL(constant.ChannelTypeOpenRouter)
+	}
+	if _, err := openRouterDiscoveryURL(baseURL, "/models"); err != nil {
+		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid request"))
+		return
+	}
+	headerOverride := ""
+	if channel.HeaderOverride != nil {
+		headerOverride = *channel.HeaderOverride
+	}
+	catalog, err := service.GetOpenRouterModelCatalog(c.Request.Context(), service.OpenRouterCatalogIdentity{
+		BaseURL: baseURL, Key: key, Proxy: strings.TrimSpace(channel.GetSetting().Proxy), HeaderOverride: headerOverride,
+	}, req.Scope, func(ctx context.Context) ([]service.OpenRouterCatalogModel, error) {
+		return fetchOpenRouterModelRows(ctx, channel, key, baseURL, req.Scope)
+	})
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusBadGateway, common.NewMessage("Failed to fetch models"))
+		return
+	}
+	common.ApiSuccess(c, catalog)
+}
+
+// ListOpenRouterModelMetadata returns only exact catalog matches for models the
+// caller can already list locally. The public catalog is never an authorization
+// source, and this route never accepts upstream URLs or credentials.
+func ListOpenRouterModelMetadata(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	names, _, err := accessibleModelNames(c)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusInternalServerError, common.NewMessage("Failed to fetch models"))
+		return
+	}
+	catalog := service.OpenRouterModelCatalog{Source: "openrouter", Scope: "public", Models: []service.OpenRouterCatalogModel{}}
+	if len(names) == 0 {
+		common.ApiSuccess(c, catalog)
+		return
+	}
+	baseURL := constant.GetChannelBaseURL(constant.ChannelTypeOpenRouter)
+	catalog, err = service.GetOpenRouterModelCatalog(c.Request.Context(), service.OpenRouterCatalogIdentity{BaseURL: baseURL}, "public",
+		func(ctx context.Context) ([]service.OpenRouterCatalogModel, error) {
+			return fetchOpenRouterModelRows(ctx, &model.Channel{Type: constant.ChannelTypeOpenRouter}, "", baseURL, "public")
+		})
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusBadGateway, common.NewMessage("Failed to fetch models"))
+		return
+	}
+	allowed := make(map[string]bool, len(names))
+	for _, name := range names {
+		allowed[name] = true
+	}
+	filtered := make([]service.OpenRouterCatalogModel, 0)
+	for _, row := range catalog.Models {
+		if allowed[row.ID] {
+			filtered = append(filtered, row)
+		}
+	}
+	catalog.Models = filtered
+	common.ApiSuccess(c, catalog)
 }
 
 func FetchOpenRouterEndpoints(c *gin.Context) {
@@ -173,9 +272,10 @@ func openRouterEndpointAPIKey(channel *model.Channel, requestKey *string) (strin
 }
 
 func validOpenRouterEndpointRequest(req openRouterEndpointDiscoveryRequest) bool {
-	if !validOpenRouterModelID(req.Model) {
-		return false
-	}
+	return validOpenRouterModelID(req.Model) && validOpenRouterDiscoveryConnection(req)
+}
+
+func validOpenRouterDiscoveryConnection(req openRouterEndpointDiscoveryRequest) bool {
 	return (req.Key == nil || len(*req.Key) <= 4096) &&
 		(req.BaseURL == nil || len(*req.BaseURL) <= 2048) &&
 		(req.Proxy == nil || len(*req.Proxy) <= 2048) &&
@@ -192,7 +292,7 @@ func validOpenRouterModelID(modelID string) bool {
 	}
 	for _, part := range []string{author, slug} {
 		for _, char := range part {
-			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("._:-", char)) {
+			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("._:~-", char)) {
 				return false
 			}
 		}
@@ -204,6 +304,10 @@ func openRouterEndpointURL(baseURL, modelID string) (string, error) {
 	if !validOpenRouterModelID(modelID) {
 		return "", errors.New("invalid OpenRouter model ID")
 	}
+	return openRouterDiscoveryURL(baseURL, "/models/"+modelID+"/endpoints")
+}
+
+func openRouterDiscoveryURL(baseURL, apiSuffix string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.RawPath != "" || len(parsed.Path) > 1024 {
 		return "", errors.New("invalid OpenRouter base URL")
@@ -217,7 +321,7 @@ func openRouterEndpointURL(baseURL, modelID string) (string, error) {
 	if apiPath != "/v1" && !strings.HasSuffix(apiPath, "/v1") {
 		apiPath += "/v1"
 	}
-	parsed.Path = apiPath + "/models/" + modelID + "/endpoints"
+	parsed.Path = apiPath + apiSuffix
 	return parsed.String(), nil
 }
 
@@ -226,6 +330,83 @@ func fetchOpenRouterEndpointRows(ctx context.Context, channel *model.Channel, ke
 	if err != nil {
 		return nil, err
 	}
+	body, err := fetchOpenRouterDiscoveryJSON(ctx, channel, key, requestURL, openRouterEndpointResponseMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	var result openRouterEndpointAPIResponse
+	if err := common.Unmarshal(body, &result); err != nil || result.Data == nil || result.Data.Endpoints == nil || len(*result.Data.Endpoints) > openRouterEndpointResponseMaxRows {
+		return nil, errors.New("invalid OpenRouter endpoint response")
+	}
+	endpoints := make([]service.OpenRouterEndpoint, 0, len(*result.Data.Endpoints))
+	for _, raw := range *result.Data.Endpoints {
+		var row struct {
+			Name         string `json:"name"`
+			ProviderName string `json:"provider_name"`
+			Tag          string `json:"tag"`
+		}
+		if err := common.Unmarshal(raw, &row); err != nil || !validOpenRouterEndpointTag(row.Tag) || !validOpenRouterEndpointText(row.Name, 512) || !validOpenRouterEndpointText(row.ProviderName, 128) {
+			return nil, errors.New("invalid OpenRouter endpoint response")
+		}
+		endpoints = append(endpoints, service.OpenRouterEndpoint{
+			ID:           row.Tag,
+			Name:         strings.TrimSpace(row.Name),
+			ProviderName: strings.TrimSpace(row.ProviderName),
+			Metadata:     raw,
+		})
+	}
+	return endpoints, nil
+}
+
+func fetchOpenRouterModelRows(ctx context.Context, channel *model.Channel, key, baseURL, scope string) ([]service.OpenRouterCatalogModel, error) {
+	suffix := "/models"
+	if scope == "account" {
+		suffix += "/user"
+	} else if scope != "public" {
+		return nil, errors.New("invalid OpenRouter catalog scope")
+	}
+	requestURL, err := openRouterDiscoveryURL(baseURL, suffix)
+	if err != nil {
+		return nil, err
+	}
+	// Both upstream lists default to text output. The rich catalog must also
+	// retain image, audio, embedding, and other model modalities.
+	requestURL += "?output_modalities=all"
+	body, err := fetchOpenRouterDiscoveryJSON(ctx, channel, key, requestURL, openRouterModelResponseMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Data  *[]common.RawMessage `json:"data"`
+		Links struct {
+			Next *string `json:"next"`
+		} `json:"links"`
+		TotalCount *int `json:"total_count"`
+	}
+	if err := common.Unmarshal(body, &result); err != nil || result.Data == nil || len(*result.Data) > openRouterModelResponseMaxRows {
+		return nil, errors.New("invalid OpenRouter model catalog")
+	}
+	// Request the complete list without pagination. Never follow upstream links
+	// with channel credentials or publish a partial list as the full catalog.
+	if (result.Links.Next != nil && *result.Links.Next != "") || (result.TotalCount != nil && *result.TotalCount != len(*result.Data)) {
+		return nil, errors.New("incomplete OpenRouter model catalog")
+	}
+	models := make([]service.OpenRouterCatalogModel, 0, len(*result.Data))
+	seen := make(map[string]bool, len(*result.Data))
+	for _, raw := range *result.Data {
+		var row struct {
+			ID string `json:"id"`
+		}
+		if err := common.Unmarshal(raw, &row); err != nil || !validOpenRouterModelID(row.ID) || seen[row.ID] {
+			return nil, errors.New("invalid OpenRouter model catalog")
+		}
+		seen[row.ID] = true
+		models = append(models, service.OpenRouterCatalogModel{ID: row.ID, Metadata: raw})
+	}
+	return models, nil
+}
+
+func fetchOpenRouterDiscoveryJSON(ctx context.Context, channel *model.Channel, key, requestURL string, maxBytes int64) ([]byte, error) {
 	headers, err := buildFetchModelsHeaders(channel, key)
 	if err != nil {
 		return nil, errors.New("invalid OpenRouter channel headers")
@@ -236,6 +417,9 @@ func fetchOpenRouterEndpointRows(ctx context.Context, channel *model.Channel, ke
 	}
 	request.Header = headers.Clone()
 	request.Header.Set("Accept", "application/json")
+	if key == "" && strings.TrimSpace(request.Header.Get("Authorization")) == "Bearer" {
+		request.Header.Del("Authorization")
+	}
 	request.Host = headers.Get("Host")
 
 	settings := channel.GetSetting()
@@ -256,26 +440,11 @@ func fetchOpenRouterEndpointRows(ctx context.Context, channel *model.Channel, ke
 	if response.StatusCode != http.StatusOK {
 		return nil, errors.New("OpenRouter endpoint request failed")
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, openRouterEndpointResponseMaxBytes+1))
-	if err != nil || len(body) > openRouterEndpointResponseMaxBytes {
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil || int64(len(body)) > maxBytes {
 		return nil, errors.New("invalid OpenRouter endpoint response")
 	}
-	var result openRouterEndpointAPIResponse
-	if err := common.Unmarshal(body, &result); err != nil || result.Data == nil || result.Data.Endpoints == nil || len(*result.Data.Endpoints) > openRouterEndpointResponseMaxRows {
-		return nil, errors.New("invalid OpenRouter endpoint response")
-	}
-	endpoints := make([]service.OpenRouterEndpoint, 0, len(*result.Data.Endpoints))
-	for _, row := range *result.Data.Endpoints {
-		if !validOpenRouterEndpointTag(row.Tag) || !validOpenRouterEndpointText(row.Name, 512) || !validOpenRouterEndpointText(row.ProviderName, 128) {
-			return nil, errors.New("invalid OpenRouter endpoint response")
-		}
-		endpoints = append(endpoints, service.OpenRouterEndpoint{
-			ID:           row.Tag,
-			Name:         strings.TrimSpace(row.Name),
-			ProviderName: strings.TrimSpace(row.ProviderName),
-		})
-	}
-	return endpoints, nil
+	return body, nil
 }
 
 func validOpenRouterEndpointTag(tag string) bool {

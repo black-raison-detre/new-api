@@ -215,7 +215,9 @@ func getModelListGroups(c *gin.Context) (modelListGroups, error) {
 	}, nil
 }
 
-func ListModels(c *gin.Context, modelType int) {
+// accessibleModelNames is shared by model listing and catalog metadata. Upstream
+// discovery never grants access to a model.
+func accessibleModelNames(c *gin.Context) ([]string, modelListGroups, error) {
 	acceptUnsetRatioModel := operation_setting.SelfUseModeEnabled
 	if !acceptUnsetRatioModel {
 		userId := c.GetInt("id")
@@ -230,11 +232,7 @@ func ListModels(c *gin.Context, modelType int) {
 	userModelNames := make([]string, 0)
 	groups, err := getModelListGroups(c)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "get user group failed",
-		})
-		return
+		return nil, modelListGroups{}, err
 	}
 	ownerGroups := groups.ownerGroups
 	modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
@@ -261,6 +259,20 @@ func ListModels(c *gin.Context, modelType int) {
 		}
 		userModelNames = append(userModelNames, modelName)
 	}
+
+	return userModelNames, groups, nil
+}
+
+func ListModels(c *gin.Context, modelType int) {
+	userModelNames, groups, err := accessibleModelNames(c)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "get user group failed",
+		})
+		return
+	}
+	ownerGroups := groups.ownerGroups
 
 	ownerByModel := map[string]string{}
 	if len(ownerGroups) > 0 {

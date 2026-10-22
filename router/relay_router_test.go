@@ -44,6 +44,24 @@ func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 		expectedField  string
 	}{
 		{
+			name:          "catalog metadata bearer token",
+			path:          "/v1/models/metadata/openrouter",
+			headerName:    "Authorization",
+			expectedField: "data",
+		},
+		{
+			name:          "catalog metadata Gemini key",
+			path:          "/v1/models/metadata/openrouter",
+			headerName:    "x-goog-api-key",
+			expectedField: "data",
+		},
+		{
+			name:          "catalog metadata Anthropic key",
+			path:          "/v1/models/metadata/openrouter",
+			headerName:    "x-api-key",
+			expectedField: "data",
+		},
+		{
 			name:           "OpenAI bearer token",
 			path:           "/v1/models",
 			headerName:     "Authorization",
@@ -87,6 +105,9 @@ func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 			}
 		})
 	}
+	unauthorized := httptest.NewRecorder()
+	engine.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/v1/models/metadata/openrouter", nil))
+	assert.Equal(t, http.StatusUnauthorized, unauthorized.Code)
 }
 
 func setupRelayRouterTestDB(t *testing.T) {

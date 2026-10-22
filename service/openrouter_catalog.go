@@ -17,14 +17,21 @@ const (
 	openRouterEndpointCatalogMaxEntries = 128
 	openRouterEndpointCatalogMaxFlight  = 32
 	openRouterEndpointCatalogTimeout    = 10 * time.Second
+	openRouterModelCatalogTTL           = 5 * time.Minute
+	openRouterModelCatalogMaxEntries    = 8
+	openRouterModelCatalogMaxFlight     = 4
+	openRouterModelCatalogTimeout       = 10 * time.Second
 )
 
 var ErrOpenRouterEndpointCatalogBusy = errors.New("OpenRouter endpoint discovery is busy")
+var ErrOpenRouterModelCatalogBusy = errors.New("OpenRouter model catalog discovery is busy")
+var ErrOpenRouterModelCatalogInvalidScope = errors.New("OpenRouter model catalog scope must be public or account")
 
 type OpenRouterEndpoint struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	ProviderName string `json:"provider_name"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	ProviderName string            `json:"provider_name"`
+	Metadata     common.RawMessage `json:"metadata,omitempty"`
 }
 
 type OpenRouterEndpointCatalog struct {
@@ -217,6 +224,222 @@ func cloneOpenRouterEndpoints(endpoints []OpenRouterEndpoint) []OpenRouterEndpoi
 		return nil
 	}
 	cloned := make([]OpenRouterEndpoint, len(endpoints))
-	copy(cloned, endpoints)
+	for i, endpoint := range endpoints {
+		cloned[i] = endpoint
+		if endpoint.Metadata != nil {
+			cloned[i].Metadata = append(common.RawMessage{}, endpoint.Metadata...)
+		}
+	}
+	return cloned
+}
+
+// OpenRouterCatalogIdentity contains the channel settings that affect a
+// catalog response. It is an alias to preserve the existing endpoint cache
+// identity contract.
+type OpenRouterCatalogIdentity = OpenRouterEndpointCatalogIdentity
+
+// OpenRouterCatalogModel retains the upstream model row without interpreting
+// pricing, capabilities, or provider-specific fields.
+type OpenRouterCatalogModel struct {
+	ID       string            `json:"id"`
+	Metadata common.RawMessage `json:"metadata"`
+}
+
+type OpenRouterModelCatalog struct {
+	Models    []OpenRouterCatalogModel `json:"models"`
+	Scope     string                   `json:"scope"`
+	FetchedAt int64                    `json:"fetched_at"`
+	Stale     bool                     `json:"stale"`
+	Source    string                   `json:"source,omitempty"`
+}
+
+type OpenRouterModelCatalogFetcher func(context.Context) ([]OpenRouterCatalogModel, error)
+
+type OpenRouterModelCatalogCache struct {
+	mu        sync.Mutex
+	entries   map[string]openRouterModelCatalogEntry
+	inFlight  map[string]*openRouterModelCatalogCall
+	now       func() time.Time
+	ttl       time.Duration
+	max       int
+	maxFlight int
+	timeout   time.Duration
+}
+
+type openRouterModelCatalogEntry struct {
+	catalog   OpenRouterModelCatalog
+	expiresAt time.Time
+	lastUsed  time.Time
+}
+
+type openRouterModelCatalogCall struct {
+	done    chan struct{}
+	catalog OpenRouterModelCatalog
+	err     error
+}
+
+func NewOpenRouterModelCatalogCache() *OpenRouterModelCatalogCache {
+	return &OpenRouterModelCatalogCache{
+		entries:   make(map[string]openRouterModelCatalogEntry),
+		inFlight:  make(map[string]*openRouterModelCatalogCall),
+		now:       time.Now,
+		ttl:       openRouterModelCatalogTTL,
+		max:       openRouterModelCatalogMaxEntries,
+		maxFlight: openRouterModelCatalogMaxFlight,
+		timeout:   openRouterModelCatalogTimeout,
+	}
+}
+
+var openRouterModelCatalogCache = NewOpenRouterModelCatalogCache()
+
+func GetOpenRouterModelCatalog(
+	ctx context.Context,
+	identity OpenRouterCatalogIdentity,
+	scope string,
+	fetch OpenRouterModelCatalogFetcher,
+) (OpenRouterModelCatalog, error) {
+	return openRouterModelCatalogCache.Get(ctx, identity, scope, fetch)
+}
+
+func (cache *OpenRouterModelCatalogCache) Get(
+	ctx context.Context,
+	identity OpenRouterCatalogIdentity,
+	scope string,
+	fetch OpenRouterModelCatalogFetcher,
+) (OpenRouterModelCatalog, error) {
+	if scope != "public" && scope != "account" {
+		return OpenRouterModelCatalog{}, ErrOpenRouterModelCatalogInvalidScope
+	}
+	if fetch == nil {
+		return OpenRouterModelCatalog{}, errors.New("OpenRouter model catalog fetcher is required")
+	}
+	key, err := hashOpenRouterModelCatalogIdentity(identity, scope)
+	if err != nil {
+		return OpenRouterModelCatalog{}, err
+	}
+
+	now := cache.now()
+	cache.mu.Lock()
+	entry, hasEntry := cache.entries[key]
+	if hasEntry && entry.expiresAt.After(now) {
+		entry.lastUsed = now
+		cache.entries[key] = entry
+		catalog := cloneOpenRouterModelCatalog(entry.catalog)
+		cache.mu.Unlock()
+		return catalog, nil
+	}
+	if call, ok := cache.inFlight[key]; ok {
+		cache.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return OpenRouterModelCatalog{}, ctx.Err()
+		case <-call.done:
+			return cloneOpenRouterModelCatalog(call.catalog), call.err
+		}
+	}
+	if len(cache.inFlight) >= cache.maxFlight {
+		cache.mu.Unlock()
+		if hasEntry {
+			stale := cloneOpenRouterModelCatalog(entry.catalog)
+			stale.Stale = true
+			return stale, nil
+		}
+		return OpenRouterModelCatalog{}, ErrOpenRouterModelCatalogBusy
+	}
+	call := &openRouterModelCatalogCall{done: make(chan struct{})}
+	cache.inFlight[key] = call
+	cache.mu.Unlock()
+
+	fetchCtx, cancel := context.WithTimeout(ctx, cache.timeout)
+	models, fetchErr := fetch(fetchCtx)
+	cancel()
+	if fetchErr == nil {
+		models = cloneOpenRouterCatalogModels(models)
+	}
+
+	now = cache.now()
+	cache.mu.Lock()
+	delete(cache.inFlight, key)
+	if fetchErr == nil {
+		catalog := OpenRouterModelCatalog{
+			Models:    models,
+			Scope:     scope,
+			FetchedAt: now.Unix(),
+			Source:    "openrouter",
+		}
+		if cache.max > 0 {
+			cache.evictModelCatalogIfFullLocked()
+			cache.entries[key] = openRouterModelCatalogEntry{
+				catalog:   cloneOpenRouterModelCatalog(catalog),
+				expiresAt: now.Add(cache.ttl),
+				lastUsed:  now,
+			}
+		}
+		call.catalog = catalog
+	} else if hasEntry {
+		call.catalog = cloneOpenRouterModelCatalog(entry.catalog)
+		call.catalog.Stale = true
+		call.err = nil
+	} else {
+		call.err = fetchErr
+	}
+	close(call.done)
+	cache.mu.Unlock()
+
+	return cloneOpenRouterModelCatalog(call.catalog), call.err
+}
+
+func hashOpenRouterModelCatalogIdentity(identity OpenRouterCatalogIdentity, scope string) (string, error) {
+	material, err := common.Marshal(struct {
+		BaseURL        string `json:"base_url"`
+		Key            string `json:"key"`
+		Proxy          string `json:"proxy"`
+		HeaderOverride string `json:"header_override"`
+		Scope          string `json:"scope"`
+	}{
+		BaseURL:        identity.BaseURL,
+		Key:            identity.Key,
+		Proxy:          identity.Proxy,
+		HeaderOverride: identity.HeaderOverride,
+		Scope:          scope,
+	})
+	if err != nil {
+		return "", fmt.Errorf("hash OpenRouter model catalog identity: %w", err)
+	}
+	digest := sha256.Sum256(material)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (cache *OpenRouterModelCatalogCache) evictModelCatalogIfFullLocked() {
+	if len(cache.entries) < cache.max {
+		return
+	}
+	var oldestKey string
+	var oldest time.Time
+	for key, entry := range cache.entries {
+		if oldestKey == "" || entry.lastUsed.Before(oldest) {
+			oldestKey = key
+			oldest = entry.lastUsed
+		}
+	}
+	delete(cache.entries, oldestKey)
+}
+
+func cloneOpenRouterModelCatalog(catalog OpenRouterModelCatalog) OpenRouterModelCatalog {
+	catalog.Models = cloneOpenRouterCatalogModels(catalog.Models)
+	return catalog
+}
+
+func cloneOpenRouterCatalogModels(models []OpenRouterCatalogModel) []OpenRouterCatalogModel {
+	if models == nil {
+		return nil
+	}
+	cloned := make([]OpenRouterCatalogModel, len(models))
+	for i, model := range models {
+		cloned[i] = model
+		if model.Metadata != nil {
+			cloned[i].Metadata = append(common.RawMessage{}, model.Metadata...)
+		}
+	}
 	return cloned
 }

@@ -2,9 +2,9 @@
 
 Recorded: 2026-10-21. Assessment baseline: `6cf0d90b5` on
 `v1.0.0-rc.45-custom`. The dedicated adaptor, native Messages, returned-cost
-billing, per-model routing, endpoint metadata, and provider-option preservation
-are implemented. Richer catalog/pricing imports, authorized cross-model fallback,
-and live routing-affinity validation are pending.
+billing, per-model routing, endpoint metadata, provider-option preservation, and
+the richer cached model catalog are implemented. Pricing imports, authorized
+cross-model fallback, and live routing-affinity validation are pending.
 
 ## Goal
 
@@ -398,7 +398,8 @@ format; retain new-api's authorization, validation, billing, and logging control
   permission. It supports saved and unsaved connection settings, bounded
   requests/responses, timeouts, credential-separated caching, last-success data,
   and exact provider IDs. Existing model fetching still returns model-ID arrays.
-  The richer catalog, endpoint prices, and pricing-import work below remains open.
+  The richer catalog and endpoint metadata are recorded in Phase 2 below;
+  pricing-import work remains open.
 - Conversation keys follow body `session_id`, `x-session-id`, and
   `prompt_cache_key`, with stable opening-message fallback. Upstream identifiers
   are opaque and scoped to authenticated user, model/policy, group, and account.
@@ -546,17 +547,132 @@ format; retain new-api's authorization, validation, billing, and logging control
 
 ## Phase 2: Catalog and provider metadata
 
-- [ ] Add a cached OpenRouter catalog service retaining capabilities, modalities,
+- [x] Add a cached OpenRouter catalog service retaining capabilities, modalities,
   context/output limits, supported parameters, and raw pricing metadata.
-- [ ] Keep existing model-fetch responses as arrays of model IDs; expose richer
+- [x] Keep existing model-fetch responses as arrays of model IDs; expose richer
   metadata through an additive API.
-- [ ] Evaluate account-filtered discovery separately from the public catalog.
+- [x] Evaluate account-filtered discovery separately from the public catalog.
   Never expose models merely because OpenRouter lists them; preserve local
   channel enablement and user access controls.
-- [ ] Fetch per-model provider endpoint details on demand, with bounded requests,
+- [x] Fetch per-model provider endpoint details on demand, with bounded requests,
   timeouts, caching, timestamps, and last-successful-data fallback.
-- [ ] Treat unavailable or null provider metrics as unknown. Do not automatically
+- [x] Treat unavailable or null provider metrics as unknown. Do not automatically
   disable channels based on upstream catalog or health changes.
+
+### Catalog metadata implementation (2026-10-22)
+
+- Added `POST /api/channel/openrouter/catalog`, guarded by the same administrator
+  authentication and channel-sensitive-write permission as endpoint discovery.
+  It accepts the existing saved/preview connection fields plus `scope`:
+  `public` (default) fetches `/models?output_modalities=all`; `account` fetches
+  `/models/user?output_modalities=all` with the selected channel key. Account scope
+  applies OpenRouter's provider preferences, privacy settings, and guardrails;
+  it is discovery data, not authorization to use any listed model locally.
+- Added token-authenticated `GET /v1/models/metadata/openrouter`. It uses the same
+  group, token model restrictions, and billing-configuration eligibility helper
+  as `/v1/models`, then returns exact model-ID matches from the public catalog.
+  Each request applies local eligibility again, including when metadata is cached.
+  Models without a matching upstream ID are omitted; aliases are not guessed.
+  The route accepts no upstream connection settings or credentials.
+- Both catalog APIs return `data.models` entries shaped as `{id, metadata}`.
+  `metadata` is the complete upstream model JSON object, preserving capabilities,
+  input/output modalities, limits, supported parameters, raw pricing strings,
+  unknown fields, and explicit null/zero/false values. `data` also records
+  `source: "openrouter"`, `scope`, `fetched_at`, and `stale`. An empty local
+  eligibility set returns an empty array without an upstream request (timestamp 0).
+  Existing model-fetch ID arrays and the normal `/v1/models` formats are preserved.
+- The model cache uses a five-minute TTL, eight retained identities, four
+  simultaneous fetches, and a ten-second deadline. Scope, credentials, base URL,
+  proxy, and header overrides are hashed into separate cache identities. Responses
+  are cloned, and failed refreshes return last-successful data marked stale with
+  its original timestamp. This is an in-memory cache, not persistent storage.
+- Catalog HTTP fetches are capped at 16 MiB / 8,192 models; endpoint fetches keep
+  their 2 MiB / 512-row bounds. Redirects are not followed, request errors omit
+  credentials and upstream bodies, and partial paginated catalog responses are
+  rejected rather than following upstream-provided links. Requests omit pagination
+  parameters to request the documented full list.
+- Existing on-demand endpoint results keep `id`, `name`, and `provider_name`,
+  and add `metadata` containing the complete endpoint row. Provider-specific
+  prices, limits, supported parameters, and nullable performance metrics survive.
+  Null or unavailable metrics remain unknown. Discovery changes no enabled
+  abilities, channel health, configured prices, reservations, or settlement.
+- Authorization review follows OWASP ASVS 5.0.0 V8.2.1–V8.2.3 and V8.3.1–V8.3.2
+  for function/data/field permissions and trusted server-side enforcement, with
+  the [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html),
+  [Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html),
+  and [Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+  guidance. Existing authentication/session mechanisms were not modified; this
+  is not a whole-application ASVS compliance claim.
+- Focused regressions passed:
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./service ./controller ./router -run 'OpenRouter|ListModels' -count=1 -timeout=3m`.
+  Coverage includes raw metadata, credential/scope isolation, cloning, cancellation,
+  bounded work, stale timestamps, request/response bounds, redirect rejection,
+  unchanged ID-only discovery, local group/token/billing restrictions, and route
+  authentication/permission guards. No new database queries, schemas, drivers,
+  frontend contracts, or independent-module APIs were changed.
+- Live read-only public discovery passed with 468 models and one endpoint for
+  `recursive/flint-v1.0:free`:
+  `TEST_OPENROUTER_PUBLIC_CATALOG=1 GOCACHE=/private/tmp/new-api-openrouter-gocache go test -v ./controller -run '^TestOpenRouterPublicCatalogLive$' -count=1 -timeout=1m`.
+  The first live run caught valid upstream `~` model IDs rejected by the discovery
+  validator; the corrected validator and regression now preserve them without
+  changing local authorization. Evidence: `/private/tmp/new-api-phase2-live.log`.
+  This proves public metadata retrieval, not authenticated account discovery,
+  inference, billing, or live routing/affinity. No upstream API key was used.
+- Initial working-tree review approved the nine code/test files at fingerprint
+  `511d2c5b283d253224555fab43dec2f8c7139936` with no actionable defects. This is
+  working-tree approval, not staged precommit approval. `git diff --check` passed.
+- The strict root command
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./... -count=1 -timeout=3m`
+  ran and failed only the known release-baseline
+  `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` in
+  `relay/channel/advancedcustom`: localhost WebSocket unexpected EOF instead of
+  the expected masked proxy host. Evidence: `/private/tmp/new-api-phase2-full-go.log`.
+  The final command below passed (exit 0, about 72 seconds), excluding only that
+  subtest; this is not an unmodified full-suite pass:
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache go test -p 2 ./... -count=1 -timeout=3m -skip '^TestAdaptorMasksDialedHostsInDialFailure$/^channel_proxy_host$'`.
+  Evidence: `/private/tmp/new-api-phase2-full-go-final.log`. Tests exercised the
+  working tree matching the initial `511d2c5b283d253224555fab43dec2f8c7139936`
+  code fingerprint, before the authenticated probe below, not an isolated staged
+  checkout. Environment-gated tests retain their usual skips; the separate live
+  public discovery command above ran without skipping.
+
+### Authenticated discovery verification (2026-10-22)
+
+- Used the operator-provided key from a private file outside the repository;
+  neither the key nor key-info response bodies are printed or stored in logs.
+  Added the opt-in `TestOpenRouterAuthenticatedCatalogLive` to the existing
+  controller regression file. It bounds the key-file read, requires private file
+  permissions, and uses only read-only metadata/key requests with redirects disabled.
+- Credential validation passed independently: `GET /api/v1/key` returned HTTP 200
+  for the real key and HTTP 401 for a deliberately invalid constant key. The first
+  probe found that `/models/user` also returned a catalog with an invalid key;
+  metadata discovery success must not be treated as credential validation or
+  local authorization. Invalid-key fallback is a live observation, not an API
+  guarantee or a production requirement imposed by the tests.
+- Live testing caught a catalog completeness gap: public `/models` defaults to
+  text-output models too. Both rich scopes now request `output_modalities=all`,
+  preserving image, audio, embedding, and other model metadata. The regression
+  verifies both query strings while preserving the legacy model-ID fetch URL.
+  The default is documented in the [OpenRouter models guide](https://openrouter.ai/docs/guides/overview/models).
+- Final authenticated live probe passed: 692 public models and 689 account-filtered
+  models, each with the same number of retained pricing and architecture records;
+  provider discovery returned one endpoint for `recursive/flint-v1.0:free`.
+  Counts are a snapshot, not fixed regression expectations. This exercises actual
+  upstream production-fetch helpers, not the gateway's deployed login/session or
+  routing middleware. No inference requests, price imports, or billing operations
+  were performed.
+- Reproduce with
+  `TEST_OPENROUTER_KEY_FILE=/private/tmp/new-api-openrouter-api-key GOCACHE=/private/tmp/new-api-openrouter-gocache go test -v ./controller -run '^TestOpenRouterAuthenticatedCatalogLive$' -count=1 -timeout=90s`.
+  Evidence: `/private/tmp/new-api-phase2-authenticated-live.log` (exit 0).
+  The key-info and invalid-key checks use the documented
+  [key endpoint](https://openrouter.ai/docs/api-reference/limits).
+- Re-ran the focused OpenRouter/ListModels command above after the completeness
+  fix: all three packages passed (exit 0, about eight seconds). Evidence:
+  `/private/tmp/new-api-phase2-focused-final.log`. The full-root runs above predate
+  this narrow query/test change and were not repeated.
+- Independent follow-up working-tree review approved current nine-file code/test
+  fingerprint `ede71b542d584155a6af33a445268a1912e75b02` with no actionable findings.
+  Whitespace checks passed.
 
 ## Phase 3: Pricing import through the existing UI
 
@@ -584,8 +700,8 @@ format; retain new-api's authorization, validation, billing, and logging control
   enterprise behavior.
 - [ ] Verify native Messages cache/token semantics, zero/missing usage, interrupted
   streams, billing bounds, settlement/refunds, and legacy OpenRouter billing.
-- [ ] Cover catalog refresh failures, stale data, provider-specific metadata, and
-  pricing import units, tiers, explicit zero, overrides, and conflicts.
+- [x] Cover catalog refresh failures, stale data, and provider-specific metadata.
+- [ ] Cover pricing import units, tiers, explicit zero, overrides, and conflicts.
 - [ ] Exercise existing channel model fetching and pricing preview/save behavior;
   run affected frontend tests, type checking, lint, and build for frontend changes.
 - [x] Run focused backend tests. If relaykit changes, also run
@@ -621,4 +737,5 @@ The full-root test exception is recorded in the returned-cost milestone.
 - [Anthropic Messages](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message)
 - [Provider routing](https://openrouter.ai/docs/guides/routing/provider-selection)
 - [Model catalog](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties)
+- [Account-filtered discovery](https://openrouter.ai/docs/api/api-reference/models/list-models-filtered-by-user-provider-preferences-privacy-settings-and-guardrails)
 - [Provider endpoint records](https://openrouter.ai/docs/api/api-reference/endpoints/list-all-endpoints-for-a-model)

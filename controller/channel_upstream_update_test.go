@@ -4,17 +4,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -622,6 +626,9 @@ func TestOpenRouterEndpointURLPreservesRoutingSuffixAndRejectsPathInjection(t *t
 	got, err = openRouterEndpointURL("https://proxy.example/custom", "openai/gpt-4.1")
 	require.NoError(t, err)
 	require.Equal(t, "https://proxy.example/custom/v1/models/openai/gpt-4.1/endpoints", got)
+	got, err = openRouterEndpointURL("https://openrouter.ai/api", "~openai/gpt-astra-latest")
+	require.NoError(t, err)
+	assert.Equal(t, "https://openrouter.ai/api/v1/models/~openai/gpt-astra-latest/endpoints", got)
 
 	for _, modelID := range []string{"openai/gpt-4.1/other", "openai/../admin", "openai/gpt-4.1?key=secret", "openai/gpt-4.1#fragment"} {
 		_, err := openRouterEndpointURL("https://openrouter.ai/api", modelID)
@@ -799,10 +806,10 @@ func requestOpenRouterEndpointDiscovery(t *testing.T, request map[string]any, wa
 		var response struct {
 			Success bool `json:"success"`
 			Data    struct {
-				Model     string              `json:"model"`
-				Endpoints []map[string]string `json:"endpoints"`
-				FetchedAt int64               `json:"fetched_at"`
-				Stale     bool                `json:"stale"`
+				Model     string                       `json:"model"`
+				Endpoints []service.OpenRouterEndpoint `json:"endpoints"`
+				FetchedAt int64                        `json:"fetched_at"`
+				Stale     bool                         `json:"stale"`
 			} `json:"data"`
 		}
 		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
@@ -811,13 +818,335 @@ func requestOpenRouterEndpointDiscovery(t *testing.T, request map[string]any, wa
 		require.NotZero(t, response.Data.FetchedAt)
 		require.False(t, response.Data.Stale)
 		require.Len(t, response.Data.Endpoints, 1)
-		require.Equal(t, wantID, response.Data.Endpoints[0]["id"])
-		require.Equal(t, "Test Provider", response.Data.Endpoints[0]["provider_name"])
+		require.Equal(t, wantID, response.Data.Endpoints[0].ID)
+		require.Equal(t, "Test Provider", response.Data.Endpoints[0].ProviderName)
 		wantName := "Saved provider"
 		if strings.HasPrefix(wantID, "baseten/") {
 			wantName = "Preview provider"
 		}
-		require.Equal(t, wantName, response.Data.Endpoints[0]["name"])
+		require.Equal(t, wantName, response.Data.Endpoints[0].Name)
 	}
 	return recorder
+}
+
+func TestFetchOpenRouterCatalogRetainsMetadataAndSeparatesAccountPreferences(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	raw := `{"id":"~openai/catalog-test","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"context_length":null,"top_provider":{"max_completion_tokens":32768},"supported_parameters":["tools","temperature"],"pricing":{"prompt":"0.000000125","completion":"0","future_price":null},"capabilities":{"future":false}}`
+	requests := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.RequestURI()
+		assert.Equal(t, "Bearer saved-catalog-secret", r.Header.Get("Authorization"))
+		if r.URL.Path == "/v1/models/user" {
+			assert.Equal(t, "all", r.URL.Query().Get("output_modalities"))
+			_, _ = w.Write([]byte(`{"data":[],"links":{"next":null},"total_count":0}`))
+			return
+		}
+		assert.Equal(t, "/v1/models", r.URL.Path)
+		_, _ = w.Write([]byte(`{"data":[` + raw + `],"links":{"next":null},"total_count":1}`))
+	}))
+	defer server.Close()
+	channel := &model.Channel{Type: constant.ChannelTypeOpenRouter, Key: "saved-catalog-secret", Name: "catalog", BaseURL: &server.URL, Models: "unchanged-local-model"}
+	require.NoError(t, db.Create(channel).Error)
+
+	for _, scope := range []string{"public", "public", "account"} {
+		body, err := common.Marshal(map[string]any{"channel_id": channel.Id, "scope": scope})
+		require.NoError(t, err)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/openrouter/catalog", bytes.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		FetchOpenRouterCatalog(ctx)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		var response struct {
+			Success bool                           `json:"success"`
+			Data    service.OpenRouterModelCatalog `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		assert.True(t, response.Success)
+		assert.Equal(t, scope, response.Data.Scope)
+		assert.NotZero(t, response.Data.FetchedAt)
+		assert.False(t, response.Data.Stale)
+		assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+		if scope == "account" {
+			assert.NotNil(t, response.Data.Models)
+			assert.Empty(t, response.Data.Models)
+		} else {
+			require.Len(t, response.Data.Models, 1)
+			assert.JSONEq(t, raw, string(response.Data.Models[0].Metadata))
+		}
+		assert.NotContains(t, recorder.Body.String(), "saved-catalog-secret")
+	}
+	assert.Len(t, requests, 2)
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, "unchanged-local-model", reloaded.Models)
+	assert.Equal(t, "saved-catalog-secret", reloaded.Key)
+	var abilities int64
+	require.NoError(t, db.Model(&model.Ability{}).Count(&abilities).Error)
+	assert.Zero(t, abilities)
+
+	// Existing upstream discovery still returns only model IDs.
+	ids, err := fetchChannelUpstreamModelIDs(channel)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"~openai/catalog-test"}, ids)
+	require.Len(t, requests, 3)
+	for _, want := range []string{
+		"/v1/models?output_modalities=all",
+		"/v1/models/user?output_modalities=all",
+		"/v1/models",
+	} {
+		assert.Equal(t, want, <-requests)
+	}
+}
+
+func TestFetchOpenRouterCatalogRejectsInvalidAndPartialResponses(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing data", body: `{}`},
+		{name: "null data", body: `{"data":null}`},
+		{name: "invalid model", body: `{"data":[{"id":"../private"}]}`},
+		{name: "duplicate IDs", body: `{"data":[{"id":"openai/a"},{"id":"openai/a"}]}`},
+		{name: "too many models", body: `{"data":[` + strings.Repeat(`{"id":"openai/a"},`, openRouterModelResponseMaxRows) + `{"id":"openai/b"}]}`},
+		{name: "partial page", body: `{"data":[],"links":{"next":"https://untrusted.invalid/?key=secret"}}`},
+		{name: "incorrect total", body: `{"data":[],"total_count":1}`},
+		{name: "trailing JSON", body: `{"data":[]} {}`},
+		{name: "oversized response", body: strings.Repeat("x", openRouterModelResponseMaxBytes+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			_, err := fetchOpenRouterModelRows(context.Background(), &model.Channel{Type: constant.ChannelTypeOpenRouter}, "secret", server.URL, "public")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "secret")
+			assert.NotContains(t, err.Error(), "untrusted.invalid")
+		})
+	}
+}
+
+func TestFetchOpenRouterCatalogValidatesRequestsAndSanitizesFailures(t *testing.T) {
+	for _, body := range []string{
+		`{"scope":"invalid"}`, `{"scope":"account"}`, `{"type":1}`, `{"channel_id":-1}`,
+		`{"base_url":"http://example.invalid/?key=secret"}`, `{"header_override":"invalid"}`,
+		strings.Repeat("x", openRouterEndpointRequestMaxBytes+1),
+	} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/openrouter/catalog", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		FetchOpenRouterCatalog(ctx)
+		assert.GreaterOrEqual(t, recorder.Code, http.StatusBadRequest)
+		assert.Less(t, recorder.Code, http.StatusInternalServerError)
+		assert.NotContains(t, recorder.Body.String(), "secret")
+	}
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { redirected = true }))
+	defer target.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"?key=secret", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	body, err := common.Marshal(map[string]any{"base_url": server.URL, "key": "secret", "scope": "account"})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/openrouter/catalog", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	FetchOpenRouterCatalog(ctx)
+	assert.Equal(t, http.StatusBadGateway, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "secret")
+	assert.NotContains(t, recorder.Body.String(), target.URL)
+	assert.False(t, redirected)
+}
+
+func TestOpenRouterMetadataRechecksLocalModelAccessWithCachedCatalog(t *testing.T) {
+	withSelfUseModeDisabled(t)
+	withTieredBillingConfig(t, map[string]string{
+		"openai/catalog-visible": "tiered_expr", "openai/catalog-token-denied": "tiered_expr", "openai/catalog-vip": "tiered_expr",
+	}, map[string]string{
+		"openai/catalog-visible": `tier("base", p * 1)`, "openai/catalog-token-denied": `tier("base", p * 1)`, "openai/catalog-vip": `tier("base", p * 1)`,
+	})
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "default", Model: "openai/catalog-visible", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "openai/catalog-token-denied", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "openai/catalog-unpriced", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "openai/catalog-disabled", ChannelId: 1, Enabled: false},
+		{Group: "vip", Model: "openai/catalog-vip", ChannelId: 1, Enabled: true},
+	}).Error)
+	models := make([]service.OpenRouterCatalogModel, 0)
+	for _, name := range []string{"visible", "token-denied", "unpriced", "disabled", "vip", "upstream-only"} {
+		id := "openai/catalog-" + name
+		raw, err := common.Marshal(map[string]any{"id": id, "pricing": map[string]string{"prompt": "0"}})
+		require.NoError(t, err)
+		models = append(models, service.OpenRouterCatalogModel{ID: id, Metadata: raw})
+	}
+	_, err := service.GetOpenRouterModelCatalog(context.Background(), service.OpenRouterCatalogIdentity{
+		BaseURL: constant.GetChannelBaseURL(constant.ChannelTypeOpenRouter),
+	}, "public", func(context.Context) ([]service.OpenRouterCatalogModel, error) { return models, nil })
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name    string
+		group   string
+		limited bool
+		allowed map[string]bool
+		want    []string
+	}{
+		{name: "group and billing filter", group: "default", want: []string{"openai/catalog-visible", "openai/catalog-token-denied"}},
+		{name: "token restriction", group: "default", limited: true, allowed: map[string]bool{"openai/catalog-visible": true}, want: []string{"openai/catalog-visible"}},
+		{name: "empty allowlist denies all", group: "default", limited: true, want: []string{}},
+		{name: "group changes use current authorization", group: "vip", want: []string{"openai/catalog-vip"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models/metadata/openrouter?base_url=http://untrusted.invalid", nil)
+			common.SetContextKey(ctx, constant.ContextKeyUserGroup, test.group)
+			common.SetContextKey(ctx, constant.ContextKeyTokenModelLimitEnabled, test.limited)
+			if test.allowed != nil {
+				common.SetContextKey(ctx, constant.ContextKeyTokenModelLimit, test.allowed)
+			}
+			ListOpenRouterModelMetadata(ctx)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			var response struct {
+				Data service.OpenRouterModelCatalog `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			ids := make([]string, 0)
+			for _, row := range response.Data.Models {
+				ids = append(ids, row.ID)
+			}
+			assert.ElementsMatch(t, test.want, ids)
+			assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+		})
+	}
+}
+
+func TestOpenRouterEndpointMetadataPreservesUnknownMetrics(t *testing.T) {
+	raw := `{"tag":"openai","name":"OpenAI","provider_name":"OpenAI","pricing":{"prompt":"0.000001"},"latency_last_30m":null,"throughput_last_30m":{"p50":0},"uptime_last_30m":null,"max_completion_tokens":null,"supports_tool_choice":false}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"endpoints":[` + raw + `]}}`))
+	}))
+	defer server.Close()
+	rows, err := fetchOpenRouterEndpointRows(context.Background(), &model.Channel{Type: constant.ChannelTypeOpenRouter}, "secret", server.URL, "openai/catalog-visible")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.JSONEq(t, raw, string(rows[0].Metadata))
+}
+
+func TestOpenRouterPublicCatalogLive(t *testing.T) {
+	if os.Getenv("TEST_OPENROUTER_PUBLIC_CATALOG") != "1" {
+		t.Skip("set TEST_OPENROUTER_PUBLIC_CATALOG=1 for read-only live public discovery")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	channel := &model.Channel{Type: constant.ChannelTypeOpenRouter}
+	baseURL := constant.GetChannelBaseURL(constant.ChannelTypeOpenRouter)
+	rows, err := fetchOpenRouterModelRows(ctx, channel, "", baseURL, "public")
+	require.NoError(t, err)
+	require.NotEmpty(t, rows)
+	endpoints, err := fetchOpenRouterEndpointRows(ctx, channel, "", baseURL, rows[0].ID)
+	require.NoError(t, err)
+	t.Logf("Read-only public discovery: %d models, %d endpoints for %s", len(rows), len(endpoints), rows[0].ID)
+}
+
+func TestOpenRouterAuthenticatedCatalogLive(t *testing.T) {
+	keyPath := os.Getenv("TEST_OPENROUTER_KEY_FILE")
+	if keyPath == "" {
+		t.Skip("set TEST_OPENROUTER_KEY_FILE for read-only authenticated discovery")
+	}
+	file, err := os.Open(keyPath)
+	if err != nil {
+		t.Fatal("cannot open OpenRouter test key file")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		t.Fatal("OpenRouter test key must be in a private regular file (permissions 600)")
+	}
+	keyBytes, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(keyBytes) > 4096 {
+		t.Fatal("cannot read a valid bounded OpenRouter test key")
+	}
+	key := strings.TrimSpace(string(keyBytes))
+	if key == "" || strings.ContainsAny(key, " \t\r\n\"'") {
+		t.Fatal("OpenRouter test key file must contain only the API key")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	channel := &model.Channel{Type: constant.ChannelTypeOpenRouter}
+	baseURL := constant.GetChannelBaseURL(constant.ChannelTypeOpenRouter)
+	keyURL, err := openRouterDiscoveryURL(baseURL, "/key")
+	require.NoError(t, err)
+	client, err := service.GetHttpClientWithProxySettings("", channel.GetSetting())
+	require.NoError(t, err)
+	keyClient := *client
+	keyClient.Timeout = 10 * time.Second
+	keyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	for _, test := range []struct {
+		name   string
+		key    string
+		status int
+	}{
+		{name: "real", key: key, status: http.StatusOK},
+		{name: "invalid control", key: "invalid-openrouter-discovery-test-key", status: http.StatusUnauthorized},
+	} {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, keyURL, nil)
+		require.NoError(t, err)
+		request.Header.Set("Authorization", "Bearer "+test.key)
+		response, err := keyClient.Do(request)
+		if err != nil {
+			t.Fatal("OpenRouter key validation request failed before a response")
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		response.Body.Close()
+		require.Equal(t, test.status, response.StatusCode, "%s key validation status", test.name)
+		t.Logf("%s key validation: HTTP %d", test.name, response.StatusCode)
+	}
+	modelID := ""
+	for _, scope := range []string{"public", "account"} {
+		rows, err := fetchOpenRouterModelRows(ctx, channel, key, baseURL, scope)
+		require.NoError(t, err, "authenticated %s discovery failed", scope)
+		require.NotNil(t, rows)
+		if scope == "public" {
+			require.NotEmpty(t, rows)
+		}
+		withPricing, withArchitecture := 0, 0
+		for _, row := range rows {
+			if bytes.Contains(row.Metadata, []byte(key)) {
+				t.Fatal("upstream metadata unexpectedly contains the test key")
+			}
+			var metadata struct {
+				Pricing      common.RawMessage `json:"pricing"`
+				Architecture common.RawMessage `json:"architecture"`
+			}
+			require.NoError(t, common.Unmarshal(row.Metadata, &metadata))
+			if len(metadata.Pricing) > 0 {
+				withPricing++
+			}
+			if len(metadata.Architecture) > 0 {
+				withArchitecture++
+			}
+			if modelID == "" && !strings.HasPrefix(row.ID, "~") && !strings.HasPrefix(row.ID, "openrouter/") {
+				modelID = row.ID
+			}
+		}
+		t.Logf("Authenticated %s discovery: %d models, %d pricing records, %d architecture records", scope, len(rows), withPricing, withArchitecture)
+	}
+	require.NotEmpty(t, modelID, "no concrete public model available for endpoint discovery")
+	endpoints, err := fetchOpenRouterEndpointRows(ctx, channel, key, baseURL, modelID)
+	require.NoError(t, err)
+	for _, endpoint := range endpoints {
+		if bytes.Contains(endpoint.Metadata, []byte(key)) {
+			t.Fatal("upstream endpoint metadata unexpectedly contains the test key")
+		}
+	}
+	t.Logf("Authenticated provider discovery: %d endpoints for %s", len(endpoints), modelID)
+
+	t.Log("No inference requests were sent")
 }
