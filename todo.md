@@ -830,12 +830,12 @@ fully validated. Redis and multiple-credential checks apply when those features
 are used in the deployment; the latest live run used in-memory affinity and one
 real upstream key.
 
-- [ ] Live protocol and streaming coverage: exercise Responses and native
+- [x] Live protocol and streaming coverage: exercise Responses and native
   Anthropic Messages in JSON and SSE modes with Standard/Nitro/Floor and locked
   provider policies. Verify mapped models, provider constraints, scoped session
-  IDs, complete responses, and returned-cost settlement/logging. The latest live
+  IDs, complete responses, and returned-cost settlement/logging. The preceding live
   routing run covered non-streaming Chat Completions only.
-- [ ] Failure and interrupted-stream accounting: cover client cancellation,
+- [x] Failure and interrupted-stream accounting: cover client cancellation,
   upstream timeouts/errors, missing final usage, and interruption after a
   generation ID is acquired. Verify the appropriate pending/recovery/refund
   behavior and repeat recovery to prove no duplicate charges or consume logs.
@@ -848,11 +848,100 @@ real upstream key.
   verify conversation-to-credential affinity, retry release, and recovery after
   disabling, removing, or rotating the preferred credential. Confirm disabled
   credentials are not reused and new accounts receive distinct session scopes.
-- [ ] Run strict `go test ./...` on the final source and record its source hash,
+- [x] Run strict `go test ./...` on the final source and record its source hash,
   exact command, result, and environment-dependent skips. If the known release-
   baseline `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` failure
   recurs, report it separately. Label any rerun excluding that exact subtest
   explicitly; do not present it as an unmodified full-suite pass.
+- [ ] Resolve the documented `channel_proxy_host` strict-suite failure or retain
+  it as an explicitly accepted release-baseline exception. The run below still
+  fails that subtest; the unmodified full suite is not green.
+- [ ] Address repository-wide frontend lint findings: the run below reports
+  158 errors and 66 warnings. This test-only follow-up does not fix those files.
+
+### Full validation run (2026-10-22)
+
+- Tested source: `c1a490c1f924555f4c1a6bda9654564c3fe33f7f` on
+  `v1.0.0-rc.45-custom`, initially clean. Environment: Go 1.27.1 darwin/arm64,
+  Bun 1.4.2, Node 26.9.0. Production source was unchanged; this follow-up only
+  updates this checklist. Pricing import remains deferred at the user's request.
+- Strict root command ran without test exclusions:
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache go test ./... -count=1`.
+  Exit 1, about 70 seconds: only
+  `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host` failed in
+  `relay/channel/advancedcustom/adaptor_test.go:90`, receiving localhost WebSocket
+  `unexpected EOF` instead of the expected `egress.private.invalid` error text.
+  Evidence: `/private/tmp/new-api-final-validation-20261022/full-go.log`.
+- The explicitly filtered rerun passed, exit 0, about 57 seconds:
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache go test -json ./... -count=1 -skip '^TestAdaptorMasksDialedHostsInDialFailure$/^channel_proxy_host$'`.
+  It recorded 5,275 passing test/subtest events and 94 skipped events across
+  47 passing packages. Skips include unconfigured MySQL/PostgreSQL/ClickHouse
+  database matrices and opt-in live integrations. This is not an unmodified
+  full-suite pass or a fresh three-database verification. Exact skip events are
+  retained in `go-excluding-baseline.log` under the evidence directory above.
+- Both independent modules passed `GOWORK=off go test ./... -count=1` and
+  `GOWORK=off go build ./...`, run inside `relaykit/` and `tokenkit/`, using
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache`.
+- Focused routing/affinity race tests passed:
+  `GOCACHE=/private/tmp/new-api-openrouter-gocache go test -race -p 2 ./service ./relay/channel/openrouter ./relay/common -run 'OpenRouter.*(Affinity|Session|Routing)|ConfiguredOpenRouter|OpenRouterStandardMode|OpenRouterPreservesProvider|OpenRouterUnconfiguredProvider' -count=1 -timeout=5m`.
+- From `web/`, `bun run test` passed all 201 files / 2,428 tests;
+  `bun run typecheck` and `bun run build` passed. `bun run lint` exited 1 with
+  158 errors and 66 warnings. Examples include `src/lib/utils.ts:39`,
+  `src/components/confirm-dialog.tsx:65`, and `scripts/sync-i18n.mjs:235`.
+  Per-check commands, exit codes, elapsed times, and logs are recorded in
+  `/private/tmp/new-api-final-validation-20261022/checks-results.json`.
+- Authenticated, read-only live discovery passed separately:
+  `TEST_OPENROUTER_KEY_FILE=/private/tmp/new-api-openrouter-api-key GOCACHE=/private/tmp/new-api-openrouter-gocache go test -v ./controller -run '^TestOpenRouterAuthenticatedCatalogLive$' -count=1 -timeout=90s`.
+  Valid-key HTTP 200 / invalid-control-key HTTP 401; 692 public models,
+  689 account-filtered models, and one provider endpoint. Counts are a snapshot.
+  Evidence: `authenticated-catalog.log` in the same directory.
+- Live authenticated gateway inference passed all 16 cases: Responses and native
+  Messages, JSON and SSE, each with Standard/Nitro/Floor/locked-provider policies.
+  The gateway used isolated SQLite users, tokens, and channel configuration;
+  inference reached real OpenRouter using one private upstream key. Each case
+  verified mapped model/suffix, preserved provider price caps, opaque body/header
+  session metadata, response content and completion, exact returned-cost ledger
+  settlement/quota, and exactly one consume log. Locked routes sent
+  `only/order=openai` and `allow_fallbacks=false`; endpoint selection is only
+  independently observable when the upstream returns provider metadata.
+  Input-token usage matched upstream and downstream in every case. Native Messages
+  SSE reports initial zero usage in `message_start` and final usage in
+  `message_delta`; the harness merges present fields from both events.
+  Final run: 16 inference calls, no generation lookups, USD 0.0000396 returned cost.
+  Including the preceding parser-diagnostic run, 32 live inference calls reported
+  USD 0.0000796 in total. An earlier fixture-token rejection made no upstream calls.
+  Command: `python3 /private/tmp/new-api-final-validation-20261022/run-harness.py protocol-live 180`.
+  Evidence: `protocol-live-results.json`, `protocol-live-run.json`, and
+  `protocol-live.log` in the same directory.
+- Deterministic gateway fault/accounting tests passed all eight cases: client
+  cancellation, upstream timeout, generation-backed HTTP error, and truncated SSE,
+  each for Responses and native Messages. These use a local TLS mock upstream,
+  not live provider fault injection. Cancellation was synchronized to receipt of
+  a protocol event/ID and ended the upstream request context for both protocols.
+  Six generation-backed cases recovered USD 0.002 / 1,000 quota each through the
+  exported service reconciler, with one wallet/token debit, consume log, quota
+  record, and generation lookup. Repeated recovery/projection did not duplicate
+  charges or logs. No-ID timeouts stayed unresolved with no charge and unchanged
+  balances; absence of an ID does not establish that upstream work was free.
+  The isolated fixtures advanced retry/lease timestamps to avoid waiting 15
+  minutes and scheduled a second pass using a settled log row and no-ID sentinel
+  rows; costs were fetched by the production recovery path. Initial fixture issues
+  (native mode disabled and unread mock request bodies) were corrected before
+  this passing run. Command:
+  `python3 /private/tmp/new-api-final-validation-20261022/run-harness.py failure-accounting 150`.
+  Evidence: `failure-accounting.log` and `failure-accounting-run.json`.
+- Redis deployment and distinct-real-account credential tests remain unchecked:
+  no active Redis/container service or second distinct upstream account was
+  available. The live run used in-memory affinity and one account. Production
+  deployment, other environment-gated integrations, and deferred pricing-import
+  acceptance are not established by these results.
+- Reproducibility manifest: `/private/tmp/new-api-final-validation-20261022/validation-manifest.json`.
+  Protocol harness SHA-256:
+  `b9eb3f536827c86807d82883f2c672513bc86753860cd0eeb7ee2b89e06a49a8`;
+  fault harness SHA-256:
+  `5d94fdc1d57f06a40665bdd4893a97a0f7ed2e1155d3bc466a6b25962dd62ba9`.
+  Harnesses and logs are temporary local artifacts; raw upstream credentials
+  were not printed or found in the saved evidence. No commit or push was made.
 
 ### Precommit verification (2026-10-21)
 
