@@ -41,6 +41,10 @@ import {
   validateAdvancedCustomConfig,
 } from './advanced-custom'
 import { readTaskExtendPluginKeys } from './channel-plugin-extensions'
+import {
+  openRouterModelRoutingSchema,
+  type OpenRouterModelRouting,
+} from './openrouter-routing'
 import { supportsResponsesWebSocket } from './responses-websocket'
 
 // ============================================================================
@@ -278,6 +282,7 @@ export const channelFormSchema = z
     is_enterprise_account: z.boolean().optional(), // OpenRouter specific
     openrouter_native_messages: z.boolean().optional(),
     openrouter_cost_billing: z.boolean().optional(),
+    openrouter_model_routing: openRouterModelRoutingSchema.optional(),
     vertex_key_type: z.enum(['json', 'api_key']).optional(), // Vertex AI specific
     vertex_project_id: z.string().optional(), // Vertex AI specific (api_key mode only)
     aws_key_type: z.enum(['ak_sk', 'api_key']).optional(), // AWS specific
@@ -474,6 +479,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   is_enterprise_account: false,
   openrouter_native_messages: false,
   openrouter_cost_billing: false,
+  openrouter_model_routing: {},
   vertex_key_type: 'json',
   vertex_project_id: '',
   aws_key_type: 'ak_sk',
@@ -556,6 +562,7 @@ export function transformChannelToFormDefaults(
   let isEnterpriseAccount = false
   let openrouterNativeMessages = false
   let openrouterCostBilling = false
+  let openrouterModelRouting: OpenRouterModelRouting = {}
   let awsKeyType: 'ak_sk' | 'api_key' = 'ak_sk'
   let awsApiType: 'invoke_model' | 'mantle' = 'invoke_model'
   let allowServiceTier = false
@@ -582,6 +589,7 @@ export function transformChannelToFormDefaults(
       openrouterNativeMessages = parsed.openrouter_native_messages === true
       openrouterCostBilling =
         parsed.openrouter_cost_billing === true && !isEnterpriseAccount
+      openrouterModelRouting = parsed.openrouter_model_routing ?? {}
       awsKeyType = parsed.aws_key_type || 'ak_sk'
       awsApiType = parsed.aws_api_type || 'invoke_model'
       allowServiceTier = parsed.allow_service_tier === true
@@ -643,6 +651,7 @@ export function transformChannelToFormDefaults(
     is_enterprise_account: isEnterpriseAccount,
     openrouter_native_messages: openrouterNativeMessages,
     openrouter_cost_billing: openrouterCostBilling,
+    openrouter_model_routing: openrouterModelRouting,
     vertex_key_type: vertexKeyType,
     vertex_project_id: vertexProjectId,
     azure_responses_version: azureResponsesVersion,
@@ -755,10 +764,21 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       formData.is_enterprise_account !== true
     settingsObj.openrouter_native_messages =
       formData.openrouter_native_messages === true
+    const routing = formData.openrouter_model_routing
+    if (
+      !formData.is_enterprise_account &&
+      routing &&
+      Object.keys(routing).length > 0
+    ) {
+      settingsObj.openrouter_model_routing = routing
+    } else {
+      delete settingsObj.openrouter_model_routing
+    }
   } else {
     delete settingsObj.openrouter_enterprise
     delete settingsObj.openrouter_native_messages
     delete settingsObj.openrouter_cost_billing
+    delete settingsObj.openrouter_model_routing
   }
 
   // AWS interface selection is opt-in; existing channels retain InvokeModel.

@@ -172,31 +172,36 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr
 	}
-
+	var usage *dto.Usage
+	var newApiErr *types.NewAPIError
 	if upstreamStream && clientStream {
-		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
-		if newApiErr != nil {
-			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
-			return nil, newApiErr
-		}
-		return usage, nil
-	}
-	if upstreamStream {
+		usage, newApiErr = openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
+	} else if upstreamStream {
 		info.IsStream = false
-		usage, newApiErr := openaichannel.OaiResponsesToChatBufferedStreamHandler(c, info, httpResp)
-		if newApiErr != nil {
-			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
-			return nil, newApiErr
-		}
-		return usage, nil
+		usage, newApiErr = openaichannel.OaiResponsesToChatBufferedStreamHandler(c, info, httpResp)
+	} else {
+		usage, newApiErr = openaichannel.OaiResponsesToChatHandler(c, info, httpResp)
 	}
-
-	usage, newApiErr := openaichannel.OaiResponsesToChatHandler(c, info, httpResp)
 	if newApiErr != nil {
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr
 	}
+	if upstreamStream && info.StreamStatus != nil {
+		common.SetContextKey(c, constant.ContextKeyResponseStreamStatus, info.StreamStatus)
+	}
+	recordOpenRouterSessionAffinityAfterConversion(c, info, httpResp, upstreamStream)
 	return usage, nil
+}
+
+func recordOpenRouterSessionAffinityAfterConversion(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response, upstreamStream bool) {
+	if c == nil || info == nil || !info.OpenRouterSessionAffinityEnabled || response == nil ||
+		response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return
+	}
+	if upstreamStream && (info.StreamStatus == nil || info.StreamStatus.ResponseOutcome() != string(relaycommon.ResponseOutcomeCompleted)) {
+		return
+	}
+	service.RecordOpenRouterSessionAffinity(c, info)
 }
 
 func isResponsesEventStreamContentType(contentType string) bool {

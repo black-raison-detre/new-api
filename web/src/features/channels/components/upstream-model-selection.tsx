@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { ArrowRightLeft, ChevronDown, Info } from 'lucide-react'
-import { useId, useMemo, useState } from 'react'
+import { useId, useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Badge } from '@/components/ui/badge'
@@ -59,6 +59,8 @@ type ModelCategoryProps = {
   onChange: (models: string[]) => void
   onRedirectModel?: (model: string) => void
   aliases?: Record<string, string>
+  disabled?: boolean
+  renderModelAction?: (model: string) => ReactNode
 }
 
 function ModelCategory(props: ModelCategoryProps) {
@@ -78,6 +80,7 @@ function ModelCategory(props: ModelCategoryProps) {
           aria-label={t('Select all models in {{category}}', {
             category: categoryName,
           })}
+          disabled={props.disabled}
           checked={allSelected}
           indeterminate={selectedCount > 0 && !allSelected}
           onCheckedChange={(checked) => {
@@ -109,12 +112,26 @@ function ModelCategory(props: ModelCategoryProps) {
         </CollapsibleTrigger>
       </div>
       <CollapsibleContent className='border-t px-3 py-2'>
-        <div className='grid gap-2 @lg:grid-cols-2'>
+        <div
+          className={
+            props.renderModelAction
+              ? 'grid gap-2'
+              : 'grid gap-2 @lg:grid-cols-2'
+          }
+        >
           {props.models.map((model) => (
-            <div key={model} className='flex min-w-0 items-start gap-2'>
+            <div
+              key={model}
+              className={
+                props.renderModelAction
+                  ? 'flex min-w-0 flex-wrap items-start gap-2'
+                  : 'flex min-w-0 items-start gap-2'
+              }
+            >
               <Checkbox
                 id={`${id}-${model}`}
                 className='mt-0.5 shrink-0'
+                disabled={props.disabled}
                 checked={selected.has(model)}
                 onCheckedChange={(checked) =>
                   props.onChange(
@@ -126,7 +143,11 @@ function ModelCategory(props: ModelCategoryProps) {
               />
               <Label
                 htmlFor={`${id}-${model}`}
-                className='min-w-0 cursor-pointer text-sm font-normal break-all'
+                className={
+                  props.renderModelAction
+                    ? 'min-w-0 flex-1 cursor-pointer text-sm font-normal break-all'
+                    : 'min-w-0 cursor-pointer text-sm font-normal break-all'
+                }
               >
                 {model}
               </Label>
@@ -156,12 +177,14 @@ function ModelCategory(props: ModelCategoryProps) {
                   </TooltipContent>
                 </Tooltip>
               )}
+              {props.renderModelAction?.(model)}
               {props.onRedirectModel && (
                 <Button
                   type='button'
                   variant='ghost'
                   size='icon-xs'
                   className='text-muted-foreground hover:text-foreground -my-1 ml-auto shrink-0'
+                  disabled={props.disabled}
                   aria-label={t('Redirect {{model}}', { model })}
                   title={t('Set up redirect')}
                   onClick={() => props.onRedirectModel?.(model)}
@@ -192,6 +215,8 @@ type UpstreamModelSelectionProps = {
   onRedirectModel?: (model: string) => void
   /** Upstream model name to the request name it is published under. */
   aliases?: Record<string, string>
+  disabled?: boolean
+  renderModelAction?: (model: string) => ReactNode
 }
 
 export function UpstreamModelSelection(props: UpstreamModelSelectionProps) {
@@ -292,7 +317,7 @@ export function UpstreamModelSelection(props: UpstreamModelSelectionProps) {
               type='button'
               variant='outline'
               size='sm'
-              disabled={!categorized.filtered.length}
+              disabled={props.disabled || !categorized.filtered.length}
               onClick={() =>
                 props.onChange([
                   ...new Set([...props.selected, ...categorized.filtered]),
@@ -351,6 +376,8 @@ export function UpstreamModelSelection(props: UpstreamModelSelectionProps) {
                 onChange={props.onChange}
                 onRedirectModel={props.onRedirectModel}
                 aliases={props.aliases}
+                disabled={props.disabled}
+                renderModelAction={props.renderModelAction}
               />
             ))}
           </TabsContent>
@@ -369,6 +396,8 @@ export function UpstreamModelSelection(props: UpstreamModelSelectionProps) {
                   onChange={props.onChange}
                   onRedirectModel={props.onRedirectModel}
                   aliases={props.aliases}
+                  disabled={props.disabled}
+                  renderModelAction={props.renderModelAction}
                 />
               )
             )}
@@ -391,6 +420,8 @@ export function UpstreamModelSelection(props: UpstreamModelSelectionProps) {
                 onChange={props.onChange}
                 onRedirectModel={props.onRedirectModel}
                 aliases={props.aliases}
+                disabled={props.disabled}
+                renderModelAction={props.renderModelAction}
               />
             </TabsContent>
           )}
@@ -407,6 +438,8 @@ export function UpstreamModelSelection(props: UpstreamModelSelectionProps) {
               onChange={props.onChange}
               onRedirectModel={props.onRedirectModel}
               aliases={props.aliases}
+              disabled={props.disabled}
+              renderModelAction={props.renderModelAction}
             />
           ))}
           {!categorized.filtered.length && (

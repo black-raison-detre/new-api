@@ -94,6 +94,42 @@ func (info *RelayInfo) OpenRouterCostBillingConfigured() bool {
 		!info.ChannelOtherSettings.IsOpenRouterEnterprise()
 }
 
+// ResolveOpenRouterModelRouting freezes the first configured per-model policy
+// for this request so a retry cannot silently switch to a different policy.
+func (info *RelayInfo) ResolveOpenRouterModelRouting(c *gin.Context) (dto.OpenRouterModelRoutingPolicy, bool, error) {
+	if info == nil || info.ChannelMeta == nil || info.ChannelType != constant.ChannelTypeOpenRouter {
+		return dto.OpenRouterModelRoutingPolicy{}, false, nil
+	}
+	if info.OpenRouterModelRoutingFrozen {
+		if info.OpenRouterModelRoutingModel != info.OriginModelName || info.ChannelOtherSettings.IsOpenRouterEnterprise() {
+			return dto.OpenRouterModelRoutingPolicy{}, false, errors.New("OpenRouter routing policy is incompatible with this retry")
+		}
+		SetOpenRouterRoutingRetryState(c, OpenRouterRoutingRetryState{
+			ExposedModel: info.OpenRouterModelRoutingModel,
+			Policy:       info.OpenRouterModelRoutingPolicy,
+		})
+		return info.OpenRouterModelRoutingPolicy, true, nil
+	}
+	if err := info.ChannelOtherSettings.ValidateOpenRouterModelRouting(); err != nil {
+		return dto.OpenRouterModelRoutingPolicy{}, false, err
+	}
+	if info.ChannelOtherSettings.IsOpenRouterEnterprise() && len(info.ChannelOtherSettings.OpenRouterModelRouting) > 0 {
+		return dto.OpenRouterModelRoutingPolicy{}, false, errors.New("OpenRouter model routing is not supported on enterprise channels")
+	}
+	policy, configured := info.ChannelOtherSettings.OpenRouterModelRouting[info.OriginModelName]
+	if !configured {
+		return dto.OpenRouterModelRoutingPolicy{}, false, nil
+	}
+	info.OpenRouterModelRoutingFrozen = true
+	info.OpenRouterModelRoutingModel = info.OriginModelName
+	info.OpenRouterModelRoutingPolicy = policy
+	SetOpenRouterRoutingRetryState(c, OpenRouterRoutingRetryState{
+		ExposedModel: info.OpenRouterModelRoutingModel,
+		Policy:       policy,
+	})
+	return policy, true, nil
+}
+
 // SupportsOpenRouterCostBillingRequest rejects formats where OpenRouter's
 // generation cost cannot safely represent the request's full billable work.
 func (info *RelayInfo) SupportsOpenRouterCostBillingRequest(c *gin.Context) bool {
@@ -353,6 +389,12 @@ type RelayInfo struct {
 	// OpenRouterGenerationID is captured from OpenRouter's X-Generation-Id
 	// response header. It is per-attempt and is never populated from body IDs.
 	OpenRouterGenerationID string
+	// OpenRouterModelRoutingPolicy is resolved from the exposed model alias on
+	// the first attempt and retained across relay retries.
+	OpenRouterModelRoutingPolicy     dto.OpenRouterModelRoutingPolicy
+	OpenRouterModelRoutingModel      string
+	OpenRouterModelRoutingFrozen     bool
+	OpenRouterSessionAffinityEnabled bool
 	// OpenRouterGenerationRecorder persists the current attempt's generation ID
 	// before any response stream is relayed to the client. It never receives or
 	// stores a channel credential.

@@ -2,10 +2,12 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -610,4 +612,212 @@ func TestDetectAllChannelUpstreamModelUpdatesRejectsExistingActiveTask(t *testin
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Contains(t, recorder.Body.String(), existing.TaskID)
 	require.Contains(t, recorder.Body.String(), "A model update task is already running or queued")
+}
+
+func TestOpenRouterEndpointURLPreservesRoutingSuffixAndRejectsPathInjection(t *testing.T) {
+	got, err := openRouterEndpointURL("https://openrouter.ai/api", "openai/gpt-4.1-nano:nitro")
+	require.NoError(t, err)
+	require.Equal(t, "https://openrouter.ai/api/v1/models/openai/gpt-4.1-nano:nitro/endpoints", got)
+
+	got, err = openRouterEndpointURL("https://proxy.example/custom", "openai/gpt-4.1")
+	require.NoError(t, err)
+	require.Equal(t, "https://proxy.example/custom/v1/models/openai/gpt-4.1/endpoints", got)
+
+	for _, modelID := range []string{"openai/gpt-4.1/other", "openai/../admin", "openai/gpt-4.1?key=secret", "openai/gpt-4.1#fragment"} {
+		_, err := openRouterEndpointURL("https://openrouter.ai/api", modelID)
+		require.Error(t, err, modelID)
+	}
+	for _, baseURL := range []string{"https://user:pass@openrouter.ai/api", "https://openrouter.ai/api?token=secret", "https://openrouter.ai/../admin"} {
+		_, err := openRouterEndpointURL(baseURL, "openai/gpt-4.1")
+		require.Error(t, err, baseURL)
+	}
+}
+
+func TestValidOpenRouterEndpointTagPreservesVariantsAndRejectsUnsafeSegments(t *testing.T) {
+	const exactVariant = "baseten/fp4/us/priority"
+	require.True(t, validOpenRouterEndpointTag(exactVariant))
+
+	for _, tag := range []string{
+		"/deepinfra/turbo",
+		"deepinfra/turbo/",
+		"deepinfra//turbo",
+		"deepinfra/../turbo",
+		"deepinfra/./turbo",
+		"deepinfra/tu rbo",
+		"deepinfra/tu:rbo",
+		"one/two/three/four/five",
+		"deepinfra/" + strings.Repeat("a", 129),
+	} {
+		require.False(t, validOpenRouterEndpointTag(tag), tag)
+	}
+}
+
+func TestFetchOpenRouterEndpointsUsesSavedAndPreviewKeysWithoutPersistingPreview(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, "/v1/models/openai/gpt-4.1-nano:nitro/endpoints", r.URL.Path)
+		var tag, name string
+		switch r.Header.Get("Authorization") {
+		case "Bearer saved-secret":
+			tag, name = "saved-provider", "Saved provider"
+		case "Bearer preview-secret":
+			tag, name = "baseten/fp4/us/priority", "Preview provider"
+		default:
+			t.Errorf("unexpected authorization header: %q", r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"endpoints":[{"tag":"` + tag + `","name":"` + name + `","provider_name":"Test Provider"}]}}`))
+	}))
+	defer server.Close()
+
+	channel := &model.Channel{Type: constant.ChannelTypeOpenRouter, Key: "saved-secret", Name: "OpenRouter test", BaseURL: &server.URL}
+	require.NoError(t, db.Create(channel).Error)
+
+	requestOpenRouterEndpointDiscovery(t, map[string]any{
+		"channel_id": channel.Id,
+		"model":      "openai/gpt-4.1-nano:nitro",
+	}, http.StatusOK, "saved-provider")
+	requestOpenRouterEndpointDiscovery(t, map[string]any{
+		"channel_id": channel.Id,
+		"key":        "preview-secret",
+		"model":      "openai/gpt-4.1-nano:nitro",
+	}, http.StatusOK, "baseten/fp4/us/priority")
+
+	reloaded, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	require.Equal(t, "saved-secret", reloaded.Key)
+	require.Equal(t, 2, calls)
+}
+
+func TestFetchOpenRouterEndpointsKeepsEmptyEndpointsAsArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"endpoints":[]}}`))
+	}))
+	defer server.Close()
+
+	recorder := requestOpenRouterEndpointDiscovery(t, map[string]any{
+		"type":     constant.ChannelTypeOpenRouter,
+		"base_url": server.URL,
+		"key":      "empty-endpoint-key",
+		"model":    "openai/gpt-4.1-nano",
+	}, http.StatusOK, "")
+	var response struct {
+		Data struct {
+			Endpoints []map[string]string `json:"endpoints"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.NotNil(t, response.Data.Endpoints)
+	require.Empty(t, response.Data.Endpoints)
+}
+
+func TestFetchOpenRouterEndpointsRejectsMalformedOversizedAndLeaksNoCredentials(t *testing.T) {
+	secret := "endpoint-secret"
+	for _, test := range []struct {
+		name   string
+		write  func(http.ResponseWriter)
+		key    string
+		status int
+	}{
+		{
+			name: "malformed response",
+			write: func(w http.ResponseWriter) {
+				_, _ = w.Write([]byte(`{"data":{"endpoints":[{"name":"OpenAI","provider_name":"OpenAI"}]}}`))
+			},
+			key:    secret,
+			status: http.StatusBadGateway,
+		},
+		{
+			name: "oversized response",
+			write: func(w http.ResponseWriter) {
+				_, _ = w.Write([]byte(strings.Repeat("x", openRouterEndpointResponseMaxBytes+1)))
+			},
+			key:    secret + "-large",
+			status: http.StatusBadGateway,
+		},
+		{
+			name: "upstream error is sanitized",
+			write: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("upstream echoed " + secret))
+			},
+			key:    secret + "-error",
+			status: http.StatusBadGateway,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				test.write(w)
+			}))
+			defer server.Close()
+
+			recorder := requestOpenRouterEndpointDiscovery(t, map[string]any{
+				"type":     constant.ChannelTypeOpenRouter,
+				"base_url": server.URL,
+				"key":      test.key,
+				"model":    "openai/gpt-4.1-nano",
+			}, test.status, "")
+			require.Contains(t, recorder.Body.String(), "Failed to fetch OpenRouter endpoints")
+			require.NotContains(t, recorder.Body.String(), test.key)
+			require.NotContains(t, recorder.Body.String(), secret)
+			require.NotContains(t, recorder.Body.String(), "upstream echoed")
+		})
+	}
+}
+
+func TestFetchOpenRouterEndpointRowsDoesNotFollowCredentialRedirects(t *testing.T) {
+	var redirected bool
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected = true
+	}))
+	defer redirectTarget.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	channel := &model.Channel{Type: constant.ChannelTypeOpenRouter, Key: "redirect-secret"}
+	_, err := fetchOpenRouterEndpointRows(context.Background(), channel, "redirect-secret", redirector.URL, "openai/gpt-4.1")
+	require.Error(t, err)
+	require.False(t, redirected)
+}
+
+func requestOpenRouterEndpointDiscovery(t *testing.T, request map[string]any, wantStatus int, wantID string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := common.Marshal(request)
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/openrouter/endpoints", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	FetchOpenRouterEndpoints(ctx)
+	require.Equal(t, wantStatus, recorder.Code, recorder.Body.String())
+	if wantID != "" {
+		var response struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Model     string              `json:"model"`
+				Endpoints []map[string]string `json:"endpoints"`
+				FetchedAt int64               `json:"fetched_at"`
+				Stale     bool                `json:"stale"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.True(t, response.Success)
+		require.Equal(t, "openai/gpt-4.1-nano:nitro", response.Data.Model)
+		require.NotZero(t, response.Data.FetchedAt)
+		require.False(t, response.Data.Stale)
+		require.Len(t, response.Data.Endpoints, 1)
+		require.Equal(t, wantID, response.Data.Endpoints[0]["id"])
+		require.Equal(t, "Test Provider", response.Data.Endpoints[0]["provider_name"])
+		wantName := "Saved provider"
+		if strings.HasPrefix(wantID, "baseten/") {
+			wantName = "Preview provider"
+		}
+		require.Equal(t, wantName, response.Data.Endpoints[0]["name"])
+	}
+	return recorder
 }

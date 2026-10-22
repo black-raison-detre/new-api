@@ -69,6 +69,8 @@ type ModelMappingEditorProps = {
   onCommit?: (value: string) => void
   draftRequest?: ModelMappingDraftRequest | null
   onDraftRequestHandled?: () => void
+  /** Reports incomplete drafts as well as invalid JSON or duplicate aliases. */
+  onValidityChange?: (valid: boolean) => void
 }
 
 type MappingRow = {
@@ -195,6 +197,17 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
       return false
     }
   }
+
+  const notifyValidity = useEffectEvent(() => {
+    props.onValidityChange?.(
+      !jsonError &&
+        duplicateSources.length === 0 &&
+        rows.every((row) => row.from.trim() && row.to.trim())
+    )
+  })
+  useEffect(() => {
+    notifyValidity()
+  }, [rows, jsonError, duplicateSources.length])
 
   const syncExternalValue = useEffectEvent(() => {
     lastEmittedRef.current = props.value

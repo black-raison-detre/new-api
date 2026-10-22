@@ -1,8 +1,9 @@
 # OpenRouter support improvements
 
 Recorded: 2026-10-21. Assessment baseline: `6cf0d90b5` on
-`v1.0.0-rc.45-custom`. The dedicated adaptor foundation is implemented; the
-remaining protocol, catalog, and pricing work is pending.
+`v1.0.0-rc.45-custom`. The dedicated adaptor, native Messages, returned-cost
+billing, and per-model routing are implemented. Richer catalog/pricing imports,
+remaining capability work, and live routing-affinity validation are pending.
 
 ## Goal
 
@@ -50,6 +51,8 @@ format; retain new-api's authorization, validation, billing, and logging control
 - [x] Add opt-in OpenRouter returned-cost billing for wallet- and subscription-funded text
   requests before implementing configurable provider routing. Apply the existing
   effective group multiplier and retain existing currency display conversion.
+- [x] Add per-model Standard/Nitro/Floor routing, exact provider locks, provider
+  discovery, and user/conversation affinity in the existing channel editor.
 - [ ] Preserve documented OpenRouter routing fields without requiring blanket
   body passthrough. Define precedence between client options and administrator
   policy; preserve explicit zero and false values.
@@ -368,6 +371,103 @@ format; retain new-api's authorization, validation, billing, and logging control
   `full-go-excluding-baseline.log`, the earlier strict `full-go.log`, per-engine
   `migration-*` and `wallet-current*` logs, `clickhouse.log`, `gateway.log`,
   `log-ui-tests.log`, `browser.log`, and desktop/phone screenshots.
+
+### Per-model routing and provider affinity (2026-10-22)
+
+- Implemented `settings.openrouter_model_routing`, keyed by the published model
+  name in each OpenRouter channel. Each entry selects Standard, Nitro, Floor,
+  or a locked provider endpoint. Existing channels and manually suffixed mappings
+  keep their behavior until a model policy is explicitly edited.
+- The existing **Configure Models** dialog now edits policies per model, displays
+  routing badges, and supports another published alias for the same upstream
+  model through the shared mapping editor. Apply updates the channel draft;
+  Cancel discards dialog edits; Update Channel persists models, mappings, and
+  policies together. All seven frontend locales contain the new copy.
+- Locked providers use exact endpoint slugs, including region/tier variants,
+  with a hard allowlist and disabled fallback. Automatic modes use native
+  `:nitro` / `:floor` suffixes after model mapping. The final outbound boundary
+  enforces configured policy after parameter overrides and body passthrough;
+  model-changing fallbacks, remote routers, and presets are rejected on these
+  configured paths. Original authorization and billing model names are retained.
+- Added the additive administrator endpoint
+  `POST /api/channel/openrouter/endpoints`, requiring channel-sensitive-write
+  permission. It supports saved and unsaved connection settings, bounded
+  requests/responses, timeouts, credential-separated caching, last-success data,
+  and exact provider IDs. Existing model fetching still returns model-ID arrays.
+  The richer catalog, endpoint prices, and pricing-import work below remains open.
+- Conversation keys follow body `session_id`, `x-session-id`, and
+  `prompt_cache_key`, with stable opening-message fallback. Upstream identifiers
+  are opaque and scoped to authenticated user, model/policy, group, and account.
+  A bounded Redis/in-memory cache prefers the same eligible channel and enabled
+  credential, including multi-key channels, for ten minutes after success.
+  Retries can release the preferred credential; changed access, configuration,
+  or disabled credentials invalidate its use.
+- OpenRouter owns provider affinity. Its documented ten-minute idle timeout,
+  provider failover, and upstream cache expiry still apply. Explicit provider
+  locks take precedence. Nitro/Floor affinity precedence is undocumented and
+  has not been verified by live OpenRouter calls in this milestone.
+- Enterprise channels retain their existing behavior and cannot enable these
+  per-model policies in this release. No database schema or migration changed.
+- Final working-tree review approved the source after fixing preset bypasses,
+  provider constraint intersections, chained mappings, operator permissions,
+  credential retry recovery, and the existing Chat/Claude-to-Responses conversion
+  path. Completed/incomplete stream regressions protect affinity recording.
+- Focused feature tests passed without skips, including real settings round trips
+  on SQLite 3.50.4, MySQL 8.0.46, and PostgreSQL 15.19. Independent `relaykit`
+  DTO tests and its standalone build passed. No schema migration was introduced.
+- Frontend validation passed 156 tests across five existing/new feature test
+  files, type checking, targeted lint/format checks, i18n sync, and production
+  build. Inspected production screenshots and exercised keyboard selection,
+  exact provider IDs, chained aliases, and atomic saves at desktop 1440x1050,
+  phone 390x844, and an additional 1280x1000 alias-chain view. Management APIs
+  were mocked for browser checks; backend provider discovery used HTTP fixtures.
+- Strict root `go test ./...` was run. The first run exposed a fixture-only
+  PostgreSQL DSN syntax problem (corrected to URL syntax) and the previously
+  documented `TestAdaptorMasksDialedHostsInDialFailure/channel_proxy_host`
+  baseline failure. The final complete root suite passed with only that exact
+  subcase excluded; it is not an unmodified full-suite pass. Other unrelated,
+  environment-dependent tests still skip; the explicit routing/settings matrix
+  had no skips.
+- One intermediate full-suite run also failed
+  `TestResponsesWebSocketReusesConnectionAndSettlesEachRequest`, admitting a third
+  request when the fixture expected an exhausted-token rejection and two logs
+  (`controller/responses_websocket_test.go:605`). The isolated test passed on
+  both this source and clean HEAD; the clean-HEAD controller suite and the final
+  current full-root suite passed. This remains an intermittent validation
+  finding to investigate, not a reproduced OpenRouter-routing defect. No extra
+  test exclusion or source change was used to obtain the final pass.
+- Security applicability review used OWASP ASVS 5.0.0 authorization controls
+  8.2.1, 8.3.1, and 8.3.2, the
+  [Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html),
+  and the [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
+  Discovery reuses server-enforced channel-sensitive-write permission; affinity
+  rechecks current channel eligibility and enabled credentials. Inference
+  affinity IDs do not authenticate users or replace browser sessions. This is
+  an applicability assessment, not an ASVS compliance claim.
+- Reproduction commands (root unless noted; the matrix additionally requires
+  isolated `TEST_MYSQL_DSN` and URL-form `TEST_POSTGRES_DSN`):
+
+  ```sh
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -v -p 2 ./... -count=1 -timeout=3m -skip '^TestAdaptorMasksDialedHostsInDialFailure$/^channel_proxy_host$'
+  GOCACHE=/private/tmp/new-api-openrouter-gocache go test -v -p 2 ./controller ./model ./service ./middleware ./relay ./relay/channel/openrouter ./relay/channel/openai ./relay/common -run 'OpenRouter|FetchOpenRouterEndpoints|InferencePresetSettingsAndDatabaseRoundTrip' -count=1
+  # Inside relaykit/:
+  GOWORK=off GOMODCACHE=/private/tmp/new-api-routing-modcache GOCACHE=/private/tmp/new-api-routing-gocache go test -p 2 ./dto -count=1
+  GOWORK=off GOMODCACHE=/private/tmp/new-api-routing-modcache GOCACHE=/private/tmp/new-api-routing-gocache go build -p 2 ./...
+  # Inside web/:
+  bun run test src/features/channels/components/__tests__/channel-configuration.test.tsx src/features/channels/components/__tests__/model-mapping-editor.test.tsx src/features/channels/components/__tests__/openrouter-model-routing.test.tsx src/features/channels/components/__tests__/upstream-model-selection.test.tsx src/features/channels/lib/__tests__/openrouter-channel.test.ts
+  bun run typecheck
+  bun run build
+  bun run i18n:sync
+  ```
+
+- Sanitized local evidence is under `/private/tmp/new-api-routing-*`, including
+  `full-go-final.log`, `final-focused.log`, `web-tests.log`, `web-typecheck.log`,
+  `web-build.log`, `browser.log`, and desktop/phone/alias-chain screenshots. No
+  live OpenRouter inference, provider-affinity precedence, or cache-hit test was
+  performed in this milestone.
+- Removed the two isolated database containers and their temporary credentials;
+  restored the previously stopped Colima VM to stopped. Existing images and the
+  user's build container were retained.
 
 ## Phase 2: Catalog and provider metadata
 

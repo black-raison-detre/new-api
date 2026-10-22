@@ -6,12 +6,14 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -56,8 +58,17 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (any, error) {
+	routedBody, err := a.routeConfiguredRequest(c, info, body)
+	if err != nil {
+		return nil, types.NewOpenAIError(errors.New(i18n.T(c, i18n.MsgRelayOpenRouterRoutingInvalid, nil)), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	if routedBody.body != nil {
+		body = routedBodyReader(routedBody, body)
+	}
+	restoreSessionHeader := applyOpenRouterSessionHeader(info, routedBody.sessionID)
+	defer restoreSessionHeader()
+
 	var response any
-	var err error
 	if info.UsesOpenRouterNativeMessages() {
 		response, err = channel.DoApiRequest(a, c, info, body)
 	} else {
@@ -88,6 +99,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, response *http.Response, info *rela
 		}
 	} else {
 		usage, apiErr = a.Adaptor.DoResponse(c, response, info)
+	}
+	if info != nil && info.OpenRouterSessionAffinityEnabled && response != nil && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusBadRequest && apiErr == nil {
+		streamCompleted := !info.IsStream || info.StreamStatus != nil && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted)
+		if streamCompleted {
+			service.RecordOpenRouterSessionAffinity(c, info)
+		}
 	}
 	return usage, apiErr
 }

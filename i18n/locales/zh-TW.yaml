@@ -48,6 +48,8 @@ relay.openrouter_cost_wallet_invalid: "您的錢包餘額超出 OpenRouter 實�
 relay.openrouter_cost_token_positive: "使用 OpenRouter 實際費用計費時，限額 API 權杖的剩餘額度必須大於零"
 relay.openrouter_cost_setup_failed: "無法安全準備 OpenRouter 實際費用計費。請重試或聯絡管理員。"
 relay.openrouter_cost_mode_changed: "重試時選擇的通道計費模式已變更。為避免扣費錯誤，請求已停止。"
+relay.openrouter_routing_invalid_request: "無法安全套用 OpenRouter 路由設定。請檢查工作階段識別碼和提供者限制。"
+openrouter_routing_retry_policy_changed: "重試期間不能變更 OpenRouter 路由政策。"
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}的初始令牌"

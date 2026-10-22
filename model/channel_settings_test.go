@@ -50,6 +50,65 @@ func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 	}
 }
 
+func TestChannelValidateSettingsRejectsUnsupportedOpenRouterRouting(t *testing.T) {
+	routing := map[string]dto.OpenRouterModelRoutingPolicy{
+		"chat-model": {Mode: dto.OpenRouterModelRoutingLocked, Provider: "google-ai-studio"},
+	}
+	for _, tt := range []struct {
+		name    string
+		channel Channel
+		wantErr string
+	}{
+		{
+			name:    "enterprise",
+			channel: Channel{Type: constant.ChannelTypeOpenRouter},
+			wantErr: "enterprise",
+		},
+		{
+			name:    "other channel type",
+			channel: Channel{Type: constant.ChannelTypeOpenAI},
+			wantErr: "only valid for OpenRouter",
+		},
+		{
+			name:    "invalid persisted mode",
+			channel: Channel{Type: constant.ChannelTypeOpenRouter},
+			wantErr: "routing mode",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := dto.ChannelOtherSettings{}
+			switch tt.name {
+			case "enterprise":
+				settings.OpenRouterEnterprise = common.GetPointer(true)
+				settings.OpenRouterModelRouting = routing
+			case "other channel type":
+				settings.OpenRouterModelRouting = routing
+			default:
+				settings.OpenRouterModelRouting = map[string]dto.OpenRouterModelRoutingPolicy{
+					"chat-model": {Mode: "fast"},
+				}
+			}
+			tt.channel.SetOtherSettings(settings)
+			err := tt.channel.ValidateSettings()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestOpenRouterMalformedPersistedRoutingSettingsFailClosed(t *testing.T) {
+	channel := &Channel{
+		Type:          constant.ChannelTypeOpenRouter,
+		OtherSettings: `{"openrouter_model_routing":"not-an-object"}`,
+	}
+	rawSettings := channel.OtherSettings
+
+	settings := channel.GetOtherSettings()
+	assert.True(t, settings.OpenRouterModelRoutingInvalid)
+	assert.Equal(t, rawSettings, channel.OtherSettings, "invalid routing data must remain present for repeated fail-closed handling")
+	require.Error(t, settings.ValidateOpenRouterModelRouting())
+}
+
 func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(t *testing.T) {
 	inferenceRoute := dto.AdvancedCustomRoute{
 		IncomingPath: "/v1/chat/completions",
@@ -151,6 +210,7 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 				require.NoError(t, table.First(&loaded, channel.Id).Error)
 				assert.False(t, loaded.GetOtherSettings().OpenRouterNativeMessages, "existing records stay on conversion")
 				assert.False(t, loaded.GetOtherSettings().OpenRouterCostBilling, "existing records keep local pricing")
+				assert.Empty(t, loaded.GetOtherSettings().OpenRouterModelRouting, "existing records keep default routing")
 				for _, enabled := range []bool{true, false} {
 					settings := loaded.GetOtherSettings()
 					settings.OpenRouterNativeMessages = enabled
@@ -166,6 +226,20 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 						assert.False(t, *settings.OpenRouterEnterprise)
 						assert.True(t, settings.AllowServiceTier)
 					}
+				}
+				settings := loaded.GetOtherSettings()
+				settings.OpenRouterModelRouting = map[string]dto.OpenRouterModelRoutingPolicy{
+					"model-standard": {Mode: dto.OpenRouterModelRoutingStandard},
+					"model-nitro":    {Mode: dto.OpenRouterModelRoutingNitro},
+					"model-floor":    {Mode: dto.OpenRouterModelRoutingFloor},
+					"model-locked":   {Mode: dto.OpenRouterModelRoutingLocked, Provider: "deepinfra/turbo/google-vertex/us-east5"},
+				}
+				loaded.SetOtherSettings(settings)
+				require.NoError(t, loaded.ValidateSettings())
+				require.NoError(t, table.Save(&loaded).Error)
+				for range 2 {
+					require.NoError(t, table.First(&loaded, channel.Id).Error)
+					assert.Equal(t, settings.OpenRouterModelRouting, loaded.GetOtherSettings().OpenRouterModelRouting)
 				}
 			})
 			for _, channelType := range []int{constant.ChannelTypeVLLM, constant.ChannelTypeSGLang} {

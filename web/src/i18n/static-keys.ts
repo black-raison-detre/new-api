@@ -19,6 +19,19 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'openrouter_model_routing is only valid for OpenRouter channels',
+  'openrouter_model_routing is not supported on enterprise channels',
+  'openrouter_model_routing has too many model rules',
+  'invalid openrouter_model_routing model key',
+  'provider is only valid for locked OpenRouter model routing',
+  'locked OpenRouter model routing requires a valid provider slug',
+  'invalid OpenRouter model routing mode',
+  'Select a provider endpoint for locked routing.',
+  'Enter a valid provider endpoint ID (up to 256 characters).',
+  'Provider endpoints are only allowed with locked routing.',
+  'Invalid OpenRouter endpoint request',
+  'Channel type does not match OpenRouter endpoint discovery',
+  'Failed to fetch OpenRouter endpoints',
   'Task usage metadata is unavailable. Pricing details cannot be displayed.',
   'This expression cannot be expanded into a price table. View the original expression below.',
   'This operation is only supported for vLLM or SGLang channels',

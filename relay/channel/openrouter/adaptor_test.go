@@ -1,6 +1,7 @@
 package openrouter_test
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -127,7 +130,18 @@ func TestNativeMessagesTransportAndOptIn(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, response.(*http.Response).Body.Close())
 			assert.Equal(t, tc.wantPath, gotPath)
-			assert.JSONEq(t, string(body), string(gotBody))
+			var actualBody map[string]json.RawMessage
+			require.NoError(t, common.Unmarshal(gotBody, &actualBody))
+			sessionID := actualBody["session_id"]
+			delete(actualBody, "session_id")
+			withoutAffinity, marshalErr := common.Marshal(actualBody)
+			require.NoError(t, marshalErr)
+			assert.JSONEq(t, string(body), string(withoutAffinity))
+			if len(sessionID) > 0 {
+				var decodedSessionID string
+				require.NoError(t, common.Unmarshal(sessionID, &decodedSessionID))
+				assert.Equal(t, decodedSessionID, gotHeader.Get("x-session-id"))
+			}
 			assert.Equal(t, "Bearer channel-key", gotHeader.Get("Authorization"))
 			assert.Equal(t, "gen-transport-test", info.OpenRouterGenerationID)
 			assert.Empty(t, gotHeader.Get("x-api-key"))
@@ -152,6 +166,491 @@ func TestNativeMessagesTransportAndOptIn(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfiguredOpenRouterRoutingRewritesFinalProtocolBodies(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name      string
+		format    types.RelayFormat
+		mode      int
+		path      string
+		finalBody string
+		wantPath  string
+	}{
+		{
+			name:      "Chat Completions",
+			format:    types.RelayFormatOpenAI,
+			mode:      relayconstant.RelayModeChatCompletions,
+			path:      "/v1/chat/completions",
+			finalBody: `{"model":"client-override","messages":[{"role":"user","content":"hello"}],"temperature":0,"stream":false}`,
+			wantPath:  "/v1/chat/completions",
+		},
+		{
+			name:      "Responses",
+			format:    types.RelayFormatOpenAIResponses,
+			mode:      relayconstant.RelayModeResponses,
+			path:      "/v1/responses",
+			finalBody: `{"model":"client-override","input":"hello","temperature":0,"stream":false}`,
+			wantPath:  "/v1/responses",
+		},
+		{
+			name:      "Claude converted to Chat",
+			format:    types.RelayFormatClaude,
+			mode:      relayconstant.RelayModeChatCompletions,
+			path:      "/v1/messages",
+			finalBody: `{"model":"client-override","messages":[{"role":"user","content":"hello"}]}`,
+			wantPath:  "/v1/chat/completions",
+		},
+		{
+			name:      "native Claude Messages",
+			format:    types.RelayFormatClaude,
+			mode:      relayconstant.RelayModeChatCompletions,
+			path:      "/v1/messages",
+			finalBody: `{"model":"client-override","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`,
+			wantPath:  "/v1/messages",
+		},
+		{
+			name:      "Gemini converted to Chat",
+			format:    types.RelayFormatGemini,
+			mode:      relayconstant.RelayModeGemini,
+			path:      "/v1beta/models/alias:generateContent",
+			finalBody: `{"model":"client-override","messages":[{"role":"user","content":"hello"}]}`,
+			wantPath:  "/v1/chat/completions",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			var gotBody []byte
+			var gotHeader http.Header
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotHeader = r.Header.Clone()
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer server.Close()
+
+			originalBody := `{"model":"alias","session_id":"caller-conversation","messages":[{"role":"user","content":"hello"}]}`
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(originalBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Header.Set("x-session-id", "client-header-session")
+			info := &relaycommon.RelayInfo{
+				RelayFormat: tc.format, RelayMode: tc.mode, RequestURLPath: tc.path,
+				OriginModelName: "alias", UserId: 42, UsingGroup: "default",
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL,
+					ApiKey: "channel-key", UpstreamModelName: "vendor/model:free:nitro",
+					HeadersOverride: map[string]any{"x-session-id": "admin-unscoped"},
+					ChannelOtherSettings: dto.ChannelOtherSettings{
+						OpenRouterNativeMessages: tc.name == "native Claude Messages",
+						OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+							"alias": {Mode: dto.OpenRouterModelRoutingFloor},
+						},
+					},
+				},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(tc.finalBody))
+			require.NoError(t, err)
+			require.NoError(t, response.(*http.Response).Body.Close())
+
+			assert.Equal(t, tc.wantPath, gotPath)
+			var outbound map[string]any
+			require.NoError(t, common.Unmarshal(gotBody, &outbound))
+			assert.Equal(t, "vendor/model:free:floor", outbound["model"], "policy uses mapped model while preserving catalog variants")
+			assert.Equal(t, "vendor/model:free:nitro", info.UpstreamModelName, "routing must not change billing/auth model identity")
+			sessionID, ok := outbound["session_id"].(string)
+			require.True(t, ok)
+			assert.NotContains(t, sessionID, "caller-conversation")
+			assert.Equal(t, sessionID, gotHeader.Get("x-session-id"))
+			assert.NotEqual(t, "admin-unscoped", gotHeader.Get("x-session-id"))
+			if tc.name == "Chat Completions" || tc.name == "Responses" {
+				assert.Equal(t, float64(0), outbound["temperature"])
+				assert.Equal(t, false, outbound["stream"])
+			}
+		})
+	}
+}
+
+func TestOpenRouterStandardModeRemovesOnlyRoutingSuffix(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+		RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 18,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "channel-key",
+			UpstreamModelName: "vendor/model:free:nitro:floor",
+			ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+				"alias": {Mode: dto.OpenRouterModelRoutingStandard},
+			}},
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+	response, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"parameter-override","messages":[{"role":"user","content":"hello"}]}`))
+	require.NoError(t, err)
+	require.NoError(t, response.(*http.Response).Body.Close())
+	var outbound map[string]any
+	require.NoError(t, common.Unmarshal(gotBody, &outbound))
+	assert.Equal(t, "vendor/model:free", outbound["model"])
+}
+
+func TestOpenRouterSessionAffinityAppliesWithoutModelPolicyAndKeepsEnterpriseUntouched(t *testing.T) {
+	service.InitHttpClient()
+	t.Run("standard channel", func(t *testing.T) {
+		var gotBody []byte
+		var gotHeader http.Header
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotHeader = r.Header.Clone()
+			gotBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer server.Close()
+
+		var sessionIDs []string
+		for _, userID := range []int{42, 43} {
+			originalBody := `{"model":"alias","session_id":"caller-conversation","messages":[{"role":"user","content":"hello"}]}`
+			finalBody := `{"model":"vendor/model:free:nitro","provider":{"order":["client-provider"]},"messages":[{"role":"user","content":"hello"}]}`
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(originalBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Header.Set("x-session-id", "ignored-header")
+			info := &relaycommon.RelayInfo{
+				RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+				RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: userID,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "shared-channel-key",
+					UpstreamModelName: "mapped/target", ChannelOtherSettings: dto.ChannelOtherSettings{},
+				},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(finalBody))
+			require.NoError(t, err)
+			require.NoError(t, response.(*http.Response).Body.Close())
+
+			var outbound map[string]any
+			require.NoError(t, common.Unmarshal(gotBody, &outbound))
+			assert.Equal(t, "vendor/model:free:nitro", outbound["model"], "manual suffix remains unchanged without a policy")
+			provider, ok := outbound["provider"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, []any{"client-provider"}, provider["order"], "unconfigured provider routing remains unchanged")
+			sessionID, ok := outbound["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, sessionID, gotHeader.Get("x-session-id"))
+			assert.NotContains(t, sessionID, "caller-conversation")
+			sessionIDs = append(sessionIDs, sessionID)
+		}
+		assert.NotEqual(t, sessionIDs[0], sessionIDs[1], "different authenticated users get separate upstream session keys")
+	})
+
+	t.Run("enterprise channel", func(t *testing.T) {
+		var gotBody []byte
+		var gotHeader http.Header
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotHeader = r.Header.Clone()
+			gotBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer server.Close()
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","session_id":"caller-conversation","messages":[{"role":"user","content":"hello"}]}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		enterprise := true
+		info := &relaycommon.RelayInfo{
+			RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+			RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 42,
+			ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "channel-key", ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterEnterprise: &enterprise}},
+		}
+		adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+		adaptor.Init(info)
+		response, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+		require.NoError(t, response.(*http.Response).Body.Close())
+		var outbound map[string]any
+		require.NoError(t, common.Unmarshal(gotBody, &outbound))
+		assert.NotContains(t, outbound, "session_id")
+		assert.Empty(t, gotHeader.Get("x-session-id"))
+	})
+
+	t.Run("other channel type", func(t *testing.T) {
+		var gotBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer server.Close()
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","session_id":"caller-conversation","messages":[{"role":"user","content":"hello"}]}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		info := &relaycommon.RelayInfo{
+			RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+			RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 42,
+			ChannelMeta: &relaycommon.ChannelMeta{
+				ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: server.URL, ApiKey: "channel-key", UpstreamModelName: "mapped/model",
+				ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+					"alias": {Mode: dto.OpenRouterModelRoutingFloor},
+				}},
+			},
+		}
+		adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+		adaptor.Init(info)
+		finalBody := `{"model":"mapped/model","messages":[{"role":"user","content":"hello"}]}`
+		response, err := adaptor.DoRequest(c, info, strings.NewReader(finalBody))
+		require.NoError(t, err)
+		require.NoError(t, response.(*http.Response).Body.Close())
+		assert.JSONEq(t, finalBody, string(gotBody))
+	})
+}
+
+func TestConfiguredOpenRouterProviderPolicyPreservesRestrictions(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	originalBody := `{"model":"alias","session_id":"conversation","provider":{"only":["google-vertex","other"],"ignore":["blocked"],"data_collection":"deny","zdr":true,"allow_fallbacks":true,"order":["client-order"],"sort":"price"}}`
+	finalBody := `{"model":"param-override","provider":{"only":["google-vertex","other"],"ignore":["final-ignore"],"data_collection":"allow","zdr":false,"allow_fallbacks":true,"order":["override-order"],"sort":"latency"}}`
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(originalBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+		RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 7,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "channel-key",
+			UpstreamModelName: "vendor/model:free",
+			ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+				"alias": {Mode: dto.OpenRouterModelRoutingLocked, Provider: "google-vertex/us-east5"},
+			}},
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+	response, err := adaptor.DoRequest(c, info, strings.NewReader(finalBody))
+	require.NoError(t, err)
+	require.NoError(t, response.(*http.Response).Body.Close())
+
+	var outbound map[string]any
+	require.NoError(t, common.Unmarshal(gotBody, &outbound))
+	assert.Equal(t, "vendor/model:free", outbound["model"])
+	provider, ok := outbound["provider"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, []any{"google-vertex/us-east5"}, provider["order"])
+	assert.Equal(t, []any{"google-vertex/us-east5"}, provider["only"])
+	assert.Equal(t, false, provider["allow_fallbacks"])
+	assert.Equal(t, []any{"blocked", "final-ignore"}, provider["ignore"])
+	assert.Equal(t, "deny", provider["data_collection"])
+	assert.Equal(t, true, provider["zdr"])
+	assert.NotContains(t, provider, "sort")
+}
+
+func TestConfiguredOpenRouterPolicyRejectsBypassAndInvalidSessionBeforeForwarding(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	forwarded := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name         string
+		originalBody string
+		finalBody    string
+		policy       dto.OpenRouterModelRoutingPolicy
+		mappedModel  string
+	}{
+		{
+			name:         "hidden fallback from original body",
+			originalBody: `{"model":"alias","models":["another-model"]}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingNitro},
+		},
+		{
+			name:         "locked provider conflicts with only",
+			originalBody: `{"model":"alias","provider":{"only":["other"]}}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingLocked, Provider: "google"},
+		},
+		{
+			name:         "locked provider conflicts with base provider ignore",
+			originalBody: `{"model":"alias","provider":{"ignore":["deepinfra"]}}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingLocked, Provider: "deepinfra/turbo"},
+		},
+		{
+			name:         "provider only intersection is empty",
+			originalBody: `{"model":"alias","provider":{"only":["deepinfra"]}}`,
+			finalBody:    `{"model":"alias","provider":{"only":["google"]}}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingNitro},
+		},
+		{
+			name:         "mapped preset model",
+			originalBody: `{"model":"alias"}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingStandard},
+			mappedModel:  "@preset/preset-slug",
+		},
+		{
+			name:         "mapped model with preset suffix",
+			originalBody: `{"model":"alias"}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingStandard},
+			mappedModel:  "vendor/model@preset/preset-slug",
+		},
+		{
+			name:         "unhandled exacto routing variant",
+			originalBody: `{"model":"alias"}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingStandard},
+			mappedModel:  "vendor/model:nitro:exacto",
+		},
+		{
+			name:         "original body preset hidden by mapped final body",
+			originalBody: `{"model":"@preset/preset-slug"}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingStandard},
+		},
+		{
+			name:         "final model override preset",
+			originalBody: `{"model":"alias"}`,
+			finalBody:    `{"model":"vendor/model@preset/preset-slug"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingStandard},
+		},
+		{
+			name:         "invalid session identifier",
+			originalBody: `{"model":"alias","session_id":"` + strings.Repeat("s", 257) + `"}`,
+			finalBody:    `{"model":"alias"}`,
+			policy:       dto.OpenRouterModelRoutingPolicy{Mode: dto.OpenRouterModelRoutingStandard},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			forwarded = false
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.originalBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+			mappedModel := tc.mappedModel
+			if mappedModel == "" {
+				mappedModel = "vendor/model"
+			}
+			info := &relaycommon.RelayInfo{
+				RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+				RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 1,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "channel-key", UpstreamModelName: mappedModel,
+					ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{"alias": tc.policy}},
+				},
+			}
+			adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			response, err := adaptor.DoRequest(c, info, strings.NewReader(tc.finalBody))
+			require.Error(t, err)
+			assert.False(t, forwarded)
+			if response != nil {
+				_ = response.(*http.Response).Body.Close()
+			}
+		})
+	}
+}
+
+func TestMalformedPersistedOpenRouterRoutingSettingsRejectBeforeForwarding(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	forwarded := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	channel := &model.Channel{Type: constant.ChannelTypeOpenRouter, OtherSettings: `{"openrouter_model_routing":"invalid"}`}
+	settings := channel.GetOtherSettings()
+	require.True(t, settings.OpenRouterModelRoutingInvalid)
+	originalSettings := channel.OtherSettings
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+		RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 8,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "channel-key",
+			ChannelOtherSettings: settings,
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+	_, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hello"}]}`))
+	require.Error(t, err)
+	assert.False(t, forwarded)
+	assert.Equal(t, originalSettings, channel.OtherSettings)
+}
+
+func TestOpenRouterModelRoutingPolicyStaysFrozenAcrossRetry(t *testing.T) {
+	service.InitHttpClient()
+	var gotModels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]json.RawMessage
+		_ = common.DecodeJson(r.Body, &body)
+		var modelName string
+		_ = common.Unmarshal(body["model"], &modelName)
+		gotModels = append(gotModels, modelName)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+		RequestURLPath: "/v1/chat/completions", OriginModelName: "alias", UserId: 5,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType: constant.ChannelTypeOpenRouter, ChannelBaseUrl: server.URL, ApiKey: "channel-key", UpstreamModelName: "vendor/model",
+			ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+				"alias": {Mode: dto.OpenRouterModelRoutingNitro},
+			}},
+		},
+	}
+	adaptor := relay.GetAdaptor(constant.APITypeOpenRouter)
+	adaptor.Init(info)
+	for range 2 {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hello"}]}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		response, err := adaptor.DoRequest(c, info, strings.NewReader(`{"model":"alias","messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+		require.NoError(t, response.(*http.Response).Body.Close())
+		info.ChannelMeta.ChannelOtherSettings.OpenRouterModelRouting = nil
+	}
+	assert.Equal(t, []string{"vendor/model:nitro", "vendor/model:nitro"}, gotModels)
 }
 
 func TestDoRequestCapturesGenerationIDFromErrorResponse(t *testing.T) {
@@ -202,8 +701,10 @@ func TestOpenRouterNativeMessagesClaudeHelperRoutingPolicy(t *testing.T) {
 		t.Run(map[bool]string{false: "existing channel follows Responses policy", true: "native overrides Responses policy"}[enabled], func(t *testing.T) {
 			var path string
 			var body map[string]any
+			var header http.Header
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				path = r.URL.Path
+				header = r.Header.Clone()
 				_ = common.DecodeJson(r.Body, &body)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -211,19 +712,25 @@ func TestOpenRouterNativeMessagesClaudeHelperRoutingPolicy(t *testing.T) {
 			}))
 			defer server.Close()
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
-			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"alias","session_id":"caller-conversation","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`))
 			c.Request.Header.Set("Content-Type", "application/json")
 			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenRouter)
 			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
 			common.SetContextKey(c, constant.ContextKeyChannelKey, "channel-key")
+			common.SetContextKey(c, constant.ContextKeyUserId, 42)
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, "alias")
-			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{OpenRouterNativeMessages: enabled})
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{
+				OpenRouterNativeMessages: enabled,
+				OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+					"alias": {Mode: dto.OpenRouterModelRoutingFloor},
+				},
+			})
 			common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"temperature": 0})
 			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{SystemPrompt: "configured system"})
 			c.Set("model_mapping", `{"alias":"anthropic/claude-sonnet-4.6"}`)
 			request := &dto.ClaudeRequest{}
 			require.NoError(t, common.UnmarshalJsonStr(`{"model":"alias","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`, request))
-			info := &relaycommon.RelayInfo{OriginModelName: "alias", RelayFormat: types.RelayFormatClaude, Request: request, RequestURLPath: "/v1/messages", StartTime: time.Now()}
+			info := &relaycommon.RelayInfo{OriginModelName: "alias", UserId: 42, RelayFormat: types.RelayFormatClaude, Request: request, RequestURLPath: "/v1/messages", StartTime: time.Now()}
 			apiErr := relay.ClaudeHelper(c, info)
 			require.NotNil(t, apiErr)
 			assert.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
@@ -235,8 +742,12 @@ func TestOpenRouterNativeMessagesClaudeHelperRoutingPolicy(t *testing.T) {
 			} else {
 				assert.Equal(t, "/v1/responses", path)
 			}
-			assert.Equal(t, "anthropic/claude-sonnet-4.6", body["model"])
+			assert.Equal(t, "anthropic/claude-sonnet-4.6:floor", body["model"])
 			assert.Equal(t, float64(0), body["temperature"])
+			sessionID, ok := body["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, sessionID, header.Get("x-session-id"))
+			assert.NotContains(t, sessionID, "caller-conversation")
 		})
 	}
 }

@@ -47,6 +47,8 @@ relay.openrouter_cost_wallet_invalid: "Your wallet balance is outside the suppor
 relay.openrouter_cost_token_positive: "Your limited API token quota must be greater than zero to use OpenRouter actual-cost billing"
 relay.openrouter_cost_setup_failed: "OpenRouter actual-cost billing could not be safely prepared. Try again or contact the administrator."
 relay.openrouter_cost_mode_changed: "A retry selected a channel with a different billing mode. The request was stopped to prevent an incorrect charge."
+relay.openrouter_routing_invalid_request: "The OpenRouter routing request could not be safely applied. Check the session identifier and provider constraints."
+openrouter_routing_retry_policy_changed: "OpenRouter routing policy cannot change during a retry."
 
 # Emails and the name of the token created at registration
 user.default_token_name: "{{.Username}}'s initial token"

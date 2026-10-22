@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 )
@@ -200,6 +201,15 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			return nil, param.TokenGroup, err
 		}
 	}
+	if channel != nil {
+		if state, configured := relaycommon.GetOpenRouterRoutingRetryState(param.Ctx); configured {
+			settings := channel.GetOtherSettings()
+			policy, found := settings.OpenRouterModelRouting[state.ExposedModel]
+			if channel.Type != constant.ChannelTypeOpenRouter || settings.IsOpenRouterEnterprise() || !found || policy != state.Policy {
+				return nil, selectGroup, errors.New(i18n.T(param.Ctx, "openrouter_routing_retry_policy_changed"))
+			}
+		}
+	}
 	return channel, selectGroup, nil
 }
 
@@ -346,6 +356,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		}
 	}
 
+	if channel == nil {
+		channel, selectGroup = getOpenRouterSessionChannel(c, modelName, usingGroup)
+	}
 	if channel == nil {
 		var err error
 		channel, selectGroup, err = CacheGetRandomSatisfiedChannel(retry)
