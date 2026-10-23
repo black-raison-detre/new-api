@@ -260,8 +260,11 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	summary.ImageTokens = usage.PromptTokensDetails.ImageTokens
 	summary.AudioTokens = usage.PromptTokensDetails.AudioTokens
 	legacyClaudeDerived := isLegacyClaudeDerivedOpenAIUsage(relayInfo, usage)
+	// Native Messages reports ordinary input separately from cache reads and
+	// writes; only the legacy OpenAI-compatible path needs this subtraction.
 	isOpenRouterClaudeBilling := relayInfo.ChannelMeta != nil &&
 		relayInfo.ChannelType == constant.ChannelTypeOpenRouter &&
+		!relayInfo.UsesOpenRouterNativeMessages() &&
 		summary.IsClaudeUsageSemantic
 
 	if isOpenRouterClaudeBilling {
@@ -388,6 +391,10 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 }
 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []*common.Message) {
+	if relayInfo != nil && relayInfo.OpenRouterCostBilling {
+		postOpenRouterCostConsumeQuota(ctx, relayInfo, usage, extraContent)
+		return
+	}
 	originUsage := usage
 	billingUsage := effectiveBillingUsage(usage)
 	if usage == nil {

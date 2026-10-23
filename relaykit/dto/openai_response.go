@@ -245,7 +245,8 @@ type Usage struct {
 	ClaudeCacheCreation5mTokens int `json:"claude_cache_creation_5_m_tokens"`
 	ClaudeCacheCreation1hTokens int `json:"claude_cache_creation_1_h_tokens"`
 
-	// OpenRouter Params
+	// Cost preserves the optional provider-reported cost value for validation;
+	// a non-nil zero is an explicit cost, while nil means it was not reported.
 	Cost any `json:"cost,omitempty"`
 }
 

@@ -28,8 +28,10 @@ const (
 )
 
 type BoundChannel struct {
-	Name string `json:"name"`
-	Type int    `json:"type"`
+	Name          string   `json:"name"`
+	Type          int      `json:"type"`
+	BillingSource string   `json:"billing_source"`
+	Groups        []string `json:"groups"`
 }
 
 type Model struct {
@@ -408,17 +410,30 @@ func GetAllModels(offset int, limit int) ([]*Model, error) {
 // ModelConnection describes an enabled route independently of catalog visibility or price.
 type ModelConnection struct {
 	AbilityWithChannel
-	ChannelName string `json:"channel_name"`
+	ChannelName   string `json:"channel_name"`
+	BillingSource string `json:"billing_source" gorm:"-"`
 }
 
 func GetModelConnections() ([]ModelConnection, error) {
-	var connections []ModelConnection
+	var rows []struct {
+		ModelConnection
+		ChannelSettings string
+	}
 	err := DB.Table("abilities").
-		Select("abilities.*, channels.type as channel_type, channels.name as channel_name").
+		Select("abilities.*, channels.type as channel_type, channels.name as channel_name, channels.settings as channel_settings").
 		Joins("JOIN channels ON abilities.channel_id = channels.id").
 		Where("abilities.enabled = ? AND channels.status = ?", true, common.ChannelStatusEnabled).
 		Order("abilities.model, abilities.channel_id").
-		Scan(&connections).Error
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	connections := make([]ModelConnection, 0, len(rows))
+	for _, row := range rows {
+		channel := Channel{Type: row.ChannelType, OtherSettings: row.ChannelSettings}
+		row.BillingSource = channel.BillingSource()
+		connections = append(connections, row.ModelConnection)
+	}
 	return connections, err
 }
 

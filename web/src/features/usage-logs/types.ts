@@ -116,6 +116,8 @@ export interface ToolSurchargeItem {
 
 export interface LogOtherData {
   admin_info?: {
+    upstream_cost_usd?: string | number
+    group_ratio?: number
     request_policy?: PolicyEvent[]
     is_multi_key?: boolean
     multi_key_index?: number
@@ -218,6 +220,7 @@ export interface LogOtherData {
   // expression; the matched tier and request-rule traces come from the actual
   // settlement run.
   billing_mode?: string
+  billing_status?: 'pending' | 'settled' | 'unresolved'
   billing_unit?: 'token' | 'request'
   fixed_price?: number
   image_count?: number

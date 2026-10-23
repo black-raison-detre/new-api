@@ -140,3 +140,61 @@ func TestTaskDurationBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenRouterConversationKeyPrecedenceAndValidation(t *testing.T) {
+	bodyKey, err := OpenRouterConversationKey([]byte(`{"session_id":"body-session","prompt_cache_key":"cache-key","messages":[{"role":"user","content":"hello"}]}`), "header-session")
+	require.NoError(t, err)
+	assert.NotContains(t, bodyKey, "body-session")
+
+	headerKey, err := OpenRouterConversationKey([]byte(`{"prompt_cache_key":"cache-key"}`), "header-session")
+	require.NoError(t, err)
+	cacheKey, err := OpenRouterConversationKey([]byte(`{"prompt_cache_key":"cache-key"}`), "")
+	require.NoError(t, err)
+	assert.NotEqual(t, headerKey, cacheKey)
+
+	for _, test := range []struct {
+		name   string
+		body   string
+		header string
+	}{
+		{name: "body session exceeds limit", body: `{"session_id":"` + strings.Repeat("s", 257) + `"}`},
+		{name: "header session exceeds limit", header: strings.Repeat("h", 257)},
+		{name: "body session is not a string", body: `{"session_id":{}}`},
+		{name: "malformed prompt cache key", body: `{"prompt_cache_key":42}`},
+		{name: "session has surrounding whitespace", body: `{"session_id":" session "}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := OpenRouterConversationKey([]byte(test.body), test.header)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestOpenRouterConversationAndSessionKeysAreStableAndScoped(t *testing.T) {
+	firstBody := []byte(`{"system":"be concise","messages":[{"role":"user","content":"opening question"},{"role":"assistant","content":"answer"},{"role":"user","content":"follow-up"}]}`)
+	secondBody := []byte(`{"system":"be concise","messages":[{"role":"user","content":"opening question"},{"role":"assistant","content":"a different answer"},{"role":"user","content":"another follow-up"}]}`)
+	firstConversation, err := OpenRouterConversationKey(firstBody, "")
+	require.NoError(t, err)
+	secondConversation, err := OpenRouterConversationKey(secondBody, "")
+	require.NoError(t, err)
+	assert.Equal(t, firstConversation, secondConversation)
+	differentSystem, err := OpenRouterConversationKey([]byte(`{"system":"use a different policy","messages":[{"role":"user","content":"opening question"},{"role":"assistant","content":"answer"}]}`), "")
+	require.NoError(t, err)
+	assert.NotEqual(t, firstConversation, differentSystem)
+
+	key := OpenRouterAffinityKey(10, "model", "default", firstConversation)
+	assert.NotEmpty(t, key)
+	assert.NotEqual(t, key, OpenRouterAffinityKey(11, "model", "default", firstConversation))
+	assert.NotEqual(t, key, OpenRouterAffinityKey(10, "other-model", "default", firstConversation))
+	assert.NotEqual(t, key, OpenRouterAffinityKey(10, "model", "other-group", firstConversation))
+
+	account := OpenRouterAccountScope("https://OPENROUTER.AI/api/v1/", "sk-test")
+	assert.Equal(t, account, OpenRouterAccountScope("https://openrouter.ai/api/v1", "sk-test"))
+	assert.NotEqual(t, account, OpenRouterAccountScope("https://openrouter.ai/api/v1", "sk-other"))
+
+	sessionID := OpenRouterSessionID(10, "model", "default", "nitro", account, firstConversation, "sk-test")
+	assert.Equal(t, sessionID, OpenRouterSessionID(10, "model", "default", "nitro", account, secondConversation, "sk-test"))
+	assert.NotEqual(t, sessionID, OpenRouterSessionID(11, "model", "default", "nitro", account, firstConversation, "sk-test"))
+	assert.NotEqual(t, sessionID, OpenRouterSessionID(10, "model", "default", "floor", account, firstConversation, "sk-test"))
+	assert.NotContains(t, sessionID, "opening question")
+}

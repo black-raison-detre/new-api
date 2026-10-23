@@ -9,7 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
-	"github.com/QuantumNous/new-api/relay/channel/openrouter"
+	openrouterdto "github.com/QuantumNous/new-api/relay/channel/openrouter/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -187,6 +187,23 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(usageFrame))
+	if info.GetChannelType() == constant.ChannelTypeOpenRouter &&
+		info.StreamStatus != nil &&
+		info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone &&
+		info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) &&
+		!info.StreamStatus.HasErrors() {
+		var accountingFrame struct {
+			Usage *dto.Usage `json:"usage"`
+			Error any        `json:"error"`
+		}
+		if err := common.UnmarshalJsonStr(lastStreamData, &accountingFrame); err == nil &&
+			accountingFrame.Usage != nil && accountingFrame.Usage.Cost != nil {
+			if accountingFrame.Error == nil {
+				usage.Cost = accountingFrame.Usage.Cost
+				info.OpenRouterCostFinal = true
+			}
+		}
+	}
 
 	for _, name := range streamFunctionCallNames {
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
@@ -261,7 +278,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	// Unmarshal to simpleResponse
 	if info.ChannelType == constant.ChannelTypeOpenRouter && info.ChannelOtherSettings.IsOpenRouterEnterprise() {
 		// 尝试解析为 openrouter enterprise
-		var enterpriseResponse openrouter.OpenRouterEnterpriseResponse
+		var enterpriseResponse openrouterdto.EnterpriseResponse
 		err = common.Unmarshal(responseBody, &enterpriseResponse)
 		if err != nil {
 			return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
@@ -317,6 +334,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			PromptTokens:     info.GetEstimatePromptTokens(),
 			CompletionTokens: completionTokens,
 			TotalTokens:      info.GetEstimatePromptTokens() + completionTokens,
+			Cost:             simpleResponse.Usage.Cost,
 		}
 		simpleResponse.Usage = *fallbackUsage
 		usageModified = true
@@ -366,6 +384,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	service.IOCopyBytesGracefully(c, resp, responseBody)
+	if info.GetChannelType() == constant.ChannelTypeOpenRouter && simpleResponse.Usage.Cost != nil {
+		info.OpenRouterCostFinal = true
+	}
 
 	return &simpleResponse.Usage, nil
 }

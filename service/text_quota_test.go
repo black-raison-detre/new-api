@@ -975,6 +975,43 @@ func TestCalculateTextQuotaSummaryKeepsPrePRClaudeOpenRouterBilling(t *testing.T
 	require.Equal(t, 798, summary.Quota)
 }
 
+func TestOpenRouterNativeMessagesCacheBilling(t *testing.T) {
+	for _, tc := range []struct {
+		name                                     string
+		input, read, write5m, write1h, wantQuota int
+	}{
+		{"cache read", 10, 1691, 0, 0, 184},
+		{"cache write", 10, 0, 1691, 0, 2129},
+		{"mixed TTL", 10, 100, 8, 12, 59},
+		{"fully cached", 0, 1691, 0, 0, 174},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "anthropic/claude-sonnet-4.6", RelayFormat: types.RelayFormatClaude,
+				FinalRequestRelayFormat: types.RelayFormatClaude, StartTime: time.Now(),
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter, ChannelOtherSettings: dto.ChannelOtherSettings{OpenRouterNativeMessages: true}},
+				PriceData:   hosttypes.PriceData{ModelRatio: 1, CompletionRatio: 1, CacheRatio: 0.1, CacheCreationRatio: 1.25, CacheCreation5mRatio: 1.25, CacheCreation1hRatio: 2, GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}},
+			}
+			usage := effectiveBillingUsage(&dto.Usage{BillingUsage: dto.NewClaudeMessagesBillingUsage(&dto.ClaudeUsage{
+				InputTokens: tc.input, OutputTokens: 5, CacheReadInputTokens: tc.read,
+				CacheCreationInputTokens: tc.write5m + tc.write1h,
+				CacheCreation:            &dto.ClaudeCacheCreationUsage{Ephemeral5mInputTokens: tc.write5m, Ephemeral1hInputTokens: tc.write1h},
+			})})
+			require.NotNil(t, usage)
+			summary := calculateTextQuotaSummary(ctx, info, usage)
+			assert.Equal(t, tc.input, summary.PromptTokens)
+			assert.Equal(t, tc.wantQuota, summary.Quota)
+			params := BuildTieredTokenParams(usage, summary.IsClaudeUsageSemantic, map[string]bool{"cr": true, "cc": true, "cc1h": true})
+			assert.Equal(t, float64(tc.input), params.P)
+			assert.Equal(t, float64(tc.input+tc.read+tc.write5m+tc.write1h), params.Len)
+			assert.Equal(t, float64(tc.read), params.CR)
+			assert.Equal(t, float64(tc.write5m), params.CC)
+			assert.Equal(t, float64(tc.write1h), params.CC1h)
+		})
+	}
+}
+
 func TestComposeTieredTextQuotaKeepsToolCallSurcharges(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

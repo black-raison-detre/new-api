@@ -1,9 +1,13 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -165,6 +169,24 @@ func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.B
 // estimate before sending. If the initial group was free and skipped
 // pre-consume, switching to a paid group creates the session at that point.
 func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	if relayInfo != nil && relayInfo.OpenRouterCostBilling {
+		if err := PrepareOpenRouterCostForSelectedGroup(c, relayInfo); err != nil {
+			var logContext context.Context
+			if c != nil && c.Request != nil {
+				logContext = c
+			}
+			logger.LogError(logContext, common.LogText("OpenRouter actual-cost billing setup failed: %s", err.Error()))
+			return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostSetupFailed)), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		return nil
+	}
+	if relayInfo != nil && relayInfo.BillingPathMode == "standard" {
+		probe := *relayInfo
+		probe.InitChannelMeta(c)
+		if probe.OpenRouterCostBillingConfigured() {
+			return types.NewErrorWithStatusCode(errors.New(openRouterCostMessage(c, i18n.MsgRelayOpenRouterCostModeChanged)), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+	}
 	snap, err := refreshTieredBillingGroup(relayInfo)
 	if err != nil {
 		return types.NewErrorWithStatusCode(

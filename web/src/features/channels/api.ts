@@ -718,3 +718,32 @@ export async function getPrefillGroups(
   const res = await api.get('/api/prefill_group', { params: { type } })
   return res.data
 }
+
+export type OpenRouterEndpointRequest = {
+  channel_id?: number
+  type?: 20
+  key?: string
+  base_url?: string
+  proxy?: string
+  header_override?: string
+  model: string
+}
+
+export type OpenRouterEndpoints = {
+  model: string
+  endpoints: { id: string; name: string; provider_name: string }[]
+  fetched_at: number
+  stale: boolean
+}
+
+export async function fetchOpenRouterEndpoints(
+  data: OpenRouterEndpointRequest,
+  signal?: AbortSignal
+): Promise<OpenRouterEndpoints> {
+  const response = await api.post<{
+    success: boolean
+    message?: string
+    data: OpenRouterEndpoints
+  }>('/api/channel/openrouter/endpoints', data, channelActionConfig({ signal }))
+  return requireServerSuccess(response.data).data
+}

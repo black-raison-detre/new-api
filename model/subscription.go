@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -266,6 +267,8 @@ type UserSubscription struct {
 
 	LastResetTime int64 `json:"last_reset_time" gorm:"type:bigint;default:0"`
 	NextResetTime int64 `json:"next_reset_time" gorm:"type:bigint;default:0;index"`
+	// QuotaCycleVersion distinguishes resets that happen within the same Unix second.
+	QuotaCycleVersion int64 `json:"-" gorm:"type:bigint;not null;default:0"`
 
 	UpgradeGroup  string `json:"upgrade_group" gorm:"type:varchar(64);default:''"`
 	PrevUserGroup string `json:"prev_user_group" gorm:"type:varchar(64);default:''"`
@@ -430,11 +433,11 @@ func getUserGroupByIdTx(tx *gorm.DB, userId int) (string, error) {
 	if tx == nil {
 		tx = DB
 	}
-	var group string
-	if err := lockForUpdate(tx).Model(&User{}).Where("id = ?", userId).Select(commonGroupCol).Find(&group).Error; err != nil {
+	var user User
+	if err := lockForUpdate(tx).Where("id = ?", userId).Select("group").Find(&user).Error; err != nil {
 		return "", err
 	}
-	return group, nil
+	return user.Group, nil
 }
 
 func downgradeUserGroupForSubscriptionTx(tx *gorm.DB, sub *UserSubscription, now int64) (string, error) {
@@ -479,6 +482,34 @@ func downgradeUserGroupForSubscriptionTx(tx *gorm.DB, sub *UserSubscription, now
 		return "", err
 	}
 	return target, nil
+}
+
+func getUserSubscriptionOwnerId(userSubscriptionId int) (int, error) {
+	var owner struct {
+		UserId int
+	}
+	if err := DB.Model(&UserSubscription{}).
+		Select("user_id").
+		Where("id = ?", userSubscriptionId).
+		Take(&owner).Error; err != nil {
+		return 0, err
+	}
+	return owner.UserId, nil
+}
+
+func lockUserThenSubscriptionTx(tx *gorm.DB, userSubscriptionId, expectedUserId int) (*UserSubscription, error) {
+	var user User
+	if err := lockForUpdate(tx).Select("id").Where("id = ?", expectedUserId).First(&user).Error; err != nil {
+		return nil, err
+	}
+	var sub UserSubscription
+	if err := lockForUpdate(tx).Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+		return nil, err
+	}
+	if sub.UserId != expectedUserId {
+		return nil, errors.New("subscription owner changed during admin mutation")
+	}
+	return &sub, nil
 }
 
 func CreateUserSubscriptionFromPlanTx(tx *gorm.DB, userId int, plan *SubscriptionPlan, source string) (*UserSubscription, error) {
@@ -935,24 +966,27 @@ func AdminInvalidateUserSubscription(userSubscriptionId int) (*common.Message, e
 		return nil, errors.New("invalid userSubscriptionId")
 	}
 	now := common.GetTimestamp()
+	ownerId, err := getUserSubscriptionOwnerId(userSubscriptionId)
+	if err != nil {
+		return nil, err
+	}
 	cacheGroup := ""
 	downgradeGroup := ""
 	var userId int
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		sub, err := lockUserThenSubscriptionTx(tx, userSubscriptionId, ownerId)
+		if err != nil {
 			return err
 		}
 		userId = sub.UserId
-		if err := tx.Model(&sub).Updates(map[string]any{
+		if err := tx.Model(sub).Updates(map[string]any{
 			"status":     "cancelled",
 			"end_time":   now,
 			"updated_at": now,
 		}).Error; err != nil {
 			return err
 		}
-		target, err := downgradeUserGroupForSubscriptionTx(tx, &sub, now)
+		target, err := downgradeUserGroupForSubscriptionTx(tx, sub, now)
 		if err != nil {
 			return err
 		}
@@ -980,17 +1014,20 @@ func AdminDeleteUserSubscription(userSubscriptionId int) (*common.Message, error
 		return nil, errors.New("invalid userSubscriptionId")
 	}
 	now := common.GetTimestamp()
+	ownerId, err := getUserSubscriptionOwnerId(userSubscriptionId)
+	if err != nil {
+		return nil, err
+	}
 	cacheGroup := ""
 	downgradeGroup := ""
 	var userId int
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		sub, err := lockUserThenSubscriptionTx(tx, userSubscriptionId, ownerId)
+		if err != nil {
 			return err
 		}
 		userId = sub.UserId
-		target, err := downgradeUserGroupForSubscriptionTx(tx, &sub, now)
+		target, err := downgradeUserGroupForSubscriptionTx(tx, sub, now)
 		if err != nil {
 			return err
 		}
@@ -1020,6 +1057,10 @@ func resetUserSubscriptionTx(tx *gorm.DB, sub *UserSubscription, plan *Subscript
 		return errors.New("invalid reset args")
 	}
 	sub.AmountUsed = 0
+	if sub.QuotaCycleVersion == math.MaxInt64 {
+		return errors.New("subscription quota cycle version is exhausted")
+	}
+	sub.QuotaCycleVersion++
 	if advanceResetTime {
 		nextReset := calcNextResetTime(time.Unix(now, 0), plan, sub.EndTime)
 		sub.NextResetTime = nextReset
@@ -1168,6 +1209,10 @@ func ExpireDueSubscriptions(limit int) (int, error) {
 	for userId := range userIds {
 		cacheGroup := ""
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			var user User
+			if err := lockForUpdate(tx).Where("id = ?", userId).First(&user).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 			res := tx.Model(&UserSubscription{}).
 				Where("user_id = ? AND status = ? AND end_time > 0 AND end_time <= ?", userId, "active", now).
 				Updates(map[string]any{
@@ -1246,6 +1291,7 @@ type SubscriptionPreConsumeRecord struct {
 	RequestId          string `json:"request_id" gorm:"type:varchar(64);uniqueIndex"`
 	UserId             int    `json:"user_id" gorm:"index"`
 	UserSubscriptionId int    `json:"user_subscription_id" gorm:"index"`
+	QuotaCycleVersion  int64  `json:"-" gorm:"type:bigint;not null;default:0"`
 	PreConsumed        int64  `json:"pre_consumed" gorm:"type:bigint;not null;default:0"`
 	Status             string `json:"status" gorm:"type:varchar(32);index"` // consumed/refunded
 	CreatedAt          int64  `json:"created_at" gorm:"bigint"`
@@ -1295,9 +1341,49 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 		return nil
 	}
 	sub.AmountUsed = 0
+	if sub.QuotaCycleVersion == math.MaxInt64 {
+		return errors.New("subscription quota cycle version is exhausted")
+	}
+	sub.QuotaCycleVersion++
 	sub.LastResetTime = base.Unix()
 	sub.NextResetTime = next
 	return tx.Save(sub).Error
+}
+
+// selectOpenRouterCostSubscriptionTx applies the regular subscription ordering
+// and due-reset rules while selecting a subscription for postpaid actual-cost
+// billing. The returned bools indicate whether any active subscription exists
+// and whether every active subscription permits wallet overflow.
+func selectOpenRouterCostSubscriptionTx(tx *gorm.DB, userId int, now int64) (*UserSubscription, *SubscriptionPlan, bool, bool, error) {
+	var subscriptions []UserSubscription
+	if err := lockForUpdate(tx).
+		Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
+		Order("end_time asc, id asc").
+		Find(&subscriptions).Error; err != nil {
+		return nil, nil, false, false, err
+	}
+	if len(subscriptions) == 0 {
+		return nil, nil, false, true, nil
+	}
+
+	allowWalletOverflow := true
+	for i := range subscriptions {
+		sub := &subscriptions[i]
+		if !sub.AllowWalletOverflow {
+			allowWalletOverflow = false
+		}
+		plan, err := getSubscriptionPlanByIdTx(tx, sub.PlanId)
+		if err != nil {
+			return nil, nil, true, allowWalletOverflow, err
+		}
+		if err := maybeResetUserSubscriptionWithPlanTx(tx, sub, plan, now); err != nil {
+			return nil, nil, true, allowWalletOverflow, err
+		}
+		if sub.AmountTotal <= 0 || sub.AmountUsed < sub.AmountTotal {
+			return sub, plan, true, allowWalletOverflow, nil
+		}
+	}
+	return nil, nil, true, allowWalletOverflow, nil
 }
 
 // PreConsumeUserSubscription pre-consumes from any active subscription total quota.
@@ -1367,6 +1453,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 				RequestId:          requestId,
 				UserId:             userId,
 				UserSubscriptionId: sub.Id,
+				QuotaCycleVersion:  sub.QuotaCycleVersion,
 				PreConsumed:        amount,
 				Status:             "consumed",
 			}
@@ -1422,8 +1509,14 @@ func RefundSubscriptionPreConsume(requestId string) error {
 			record.Status = "refunded"
 			return tx.Save(&record).Error
 		}
-		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
+		var sub UserSubscription
+		if err := lockForUpdate(tx).Where("id = ?", record.UserSubscriptionId).First(&sub).Error; err != nil {
 			return err
+		}
+		if record.QuotaCycleVersion == sub.QuotaCycleVersion {
+			if err := applySubscriptionQuotaDeltaTx(tx, &sub, -record.PreConsumed); err != nil {
+				return err
+			}
 		}
 		record.Status = "refunded"
 		return tx.Save(&record).Error
@@ -1512,6 +1605,24 @@ func GetSubscriptionPlanInfoByUserSubscriptionId(userSubscriptionId int) (*Subsc
 	return info, nil
 }
 
+func applySubscriptionQuotaDeltaTx(tx *gorm.DB, sub *UserSubscription, delta int64) error {
+	if delta > 0 && sub.AmountUsed > math.MaxInt64-delta {
+		return errors.New("subscription used quota overflows")
+	}
+	if delta < 0 && sub.AmountUsed < math.MinInt64-delta {
+		return errors.New("subscription used quota underflows")
+	}
+	newUsed := sub.AmountUsed + delta
+	if newUsed < 0 {
+		newUsed = 0
+	}
+	if delta > 0 && sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
+		return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
+	}
+	sub.AmountUsed = newUsed
+	return tx.Save(sub).Error
+}
+
 // Update subscription used amount by delta (positive consume more, negative refund).
 func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error {
 	if userSubscriptionId <= 0 {
@@ -1527,11 +1638,6 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error
 			First(&sub).Error; err != nil {
 			return err
 		}
-		newUsed := max(sub.AmountUsed+delta, 0)
-		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
-			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
-		}
-		sub.AmountUsed = newUsed
-		return tx.Save(&sub).Error
+		return applySubscriptionQuotaDeltaTx(tx, &sub, delta)
 	})
 }

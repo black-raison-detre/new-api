@@ -2,9 +2,11 @@ package dto
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"testing"
 
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -735,4 +737,54 @@ func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
 	err := (&ChannelOtherSettings{ToolLossPolicy: "drop"}).ValidateToolLossPolicy()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tool_loss_policy")
+}
+
+func TestChannelOtherSettingsOpenRouterCostBillingRoundTrip(t *testing.T) {
+	settings := ChannelOtherSettings{OpenRouterCostBilling: true}
+	encoded, err := kitutil.Marshal(settings)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"openrouter_cost_billing":true`)
+
+	var decoded ChannelOtherSettings
+	require.NoError(t, kitutil.Unmarshal(encoded, &decoded))
+	assert.True(t, decoded.OpenRouterCostBilling)
+}
+
+func TestChannelOtherSettingsOpenRouterModelRoutingValidationAndRoundTrip(t *testing.T) {
+	settings := ChannelOtherSettings{OpenRouterModelRouting: map[string]OpenRouterModelRoutingPolicy{
+		"chat-standard": {Mode: OpenRouterModelRoutingStandard},
+		"chat-nitro":    {Mode: OpenRouterModelRoutingNitro},
+		"chat-floor":    {Mode: OpenRouterModelRoutingFloor},
+		"chat-locked":   {Mode: OpenRouterModelRoutingLocked, Provider: "deepinfra/turbo/google-vertex/us-east5"},
+	}}
+	require.NoError(t, settings.ValidateOpenRouterModelRouting())
+	encoded, err := kitutil.Marshal(settings)
+	require.NoError(t, err)
+
+	var decoded ChannelOtherSettings
+	require.NoError(t, kitutil.Unmarshal(encoded, &decoded))
+	assert.Equal(t, settings.OpenRouterModelRouting, decoded.OpenRouterModelRouting)
+
+	for _, invalid := range []struct {
+		name   string
+		policy map[string]OpenRouterModelRoutingPolicy
+	}{
+		{name: "unknown mode", policy: map[string]OpenRouterModelRoutingPolicy{"model": {Mode: "fast"}}},
+		{name: "locked provider missing", policy: map[string]OpenRouterModelRoutingPolicy{"model": {Mode: OpenRouterModelRoutingLocked}}},
+		{name: "provider on automatic mode", policy: map[string]OpenRouterModelRoutingPolicy{"model": {Mode: OpenRouterModelRoutingNitro, Provider: "google"}}},
+		{name: "provider slug traversal", policy: map[string]OpenRouterModelRoutingPolicy{"model": {Mode: OpenRouterModelRoutingLocked, Provider: "google/../provider"}}},
+		{name: "provider slug empty segment", policy: map[string]OpenRouterModelRoutingPolicy{"model": {Mode: OpenRouterModelRoutingLocked, Provider: "google//region"}}},
+		{name: "blank model alias", policy: map[string]OpenRouterModelRoutingPolicy{" ": {Mode: OpenRouterModelRoutingStandard}}},
+	} {
+		t.Run(invalid.name, func(t *testing.T) {
+			err := (&ChannelOtherSettings{OpenRouterModelRouting: invalid.policy}).ValidateOpenRouterModelRouting()
+			require.Error(t, err)
+		})
+	}
+
+	tooManyRules := make(map[string]OpenRouterModelRoutingPolicy, MaxOpenRouterModelRoutingRules+1)
+	for i := range MaxOpenRouterModelRoutingRules + 1 {
+		tooManyRules[fmt.Sprintf("model-%d", i)] = OpenRouterModelRoutingPolicy{Mode: OpenRouterModelRoutingStandard}
+	}
+	require.Error(t, (&ChannelOtherSettings{OpenRouterModelRouting: tooManyRules}).ValidateOpenRouterModelRouting())
 }

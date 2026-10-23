@@ -2,13 +2,19 @@ package model
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 func resetPricingEndpointTestTables(t *testing.T) {
@@ -40,7 +46,7 @@ func insertPricingEndpointChannel(t *testing.T, channelID int, channelType int, 
 		Status: common.ChannelStatusEnabled,
 		Name:   fmt.Sprintf("channel-%d", channelID),
 	}
-	if settings.AdvancedCustom != nil {
+	if settings.AdvancedCustom != nil || settings.OpenRouterNativeMessages || settings.OpenRouterEnterprise != nil {
 		channel.SetOtherSettings(settings)
 	}
 	require.NoError(t, DB.Create(channel).Error)
@@ -188,6 +194,138 @@ func TestPricingNativeChannelEndpointTypesUnchanged(t *testing.T) {
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAI}, byModel["gpt-4o"])
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}, byModel["gemini-2.5-flash"])
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}, byModel["claude-3-5-sonnet"])
+}
+
+func TestPricingOpenRouterEndpointTypesFollowChannelSettings(t *testing.T) {
+	chatAndResponses := []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+	}
+
+	for _, tc := range []struct {
+		name               string
+		memoryCacheEnabled bool
+	}{
+		{name: "memory cache", memoryCacheEnabled: true},
+		{name: "database lookup", memoryCacheEnabled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetPricingEndpointTestTables(t)
+			common.MemoryCacheEnabled = tc.memoryCacheEnabled
+
+			insertPricingEndpointChannel(t, 501, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{})
+			insertPricingEndpointChannel(t, 502, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{OpenRouterNativeMessages: true})
+			insertPricingEndpointChannel(t, 503, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{
+				OpenRouterNativeMessages: true,
+				OpenRouterEnterprise:     common.GetPointer(true),
+			})
+			insertPricingEndpointChannel(t, 504, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{
+				OpenRouterNativeMessages: true,
+				OpenRouterEnterprise:     common.GetPointer(false),
+			})
+			insertPricingEndpointChannel(t, 505, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{})
+			insertPricingEndpointChannel(t, 506, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{OpenRouterNativeMessages: true})
+			insertPricingEndpointAbility(t, 501, "openrouter-default")
+			insertPricingEndpointAbility(t, 502, "openrouter-native-messages")
+			insertPricingEndpointAbility(t, 503, "openrouter-enterprise")
+			insertPricingEndpointAbility(t, 504, "openrouter-explicit-non-enterprise")
+			insertPricingEndpointAbility(t, 505, "openrouter-shared-model")
+			insertPricingEndpointAbility(t, 506, "openrouter-shared-model")
+
+			byModel := pricingEndpointTypesByModel(t)
+			assert.Equal(t, chatAndResponses, byModel["openrouter-default"])
+			assert.Equal(t, append(chatAndResponses, constant.EndpointTypeAnthropic), byModel["openrouter-native-messages"])
+			assert.Equal(t, chatAndResponses, byModel["openrouter-enterprise"])
+			assert.Equal(t, append(chatAndResponses, constant.EndpointTypeAnthropic), byModel["openrouter-explicit-non-enterprise"])
+			assert.Equal(t, append(chatAndResponses, constant.EndpointTypeAnthropic), byModel["openrouter-shared-model"])
+		})
+	}
+}
+
+func TestPricingOpenRouterNativeMessagesSettingInvalidatesMetadata(t *testing.T) {
+	resetPricingEndpointTestTables(t)
+	insertPricingEndpointChannel(t, 601, constant.ChannelTypeOpenRouter, dto.ChannelOtherSettings{OpenRouterNativeMessages: true})
+	insertPricingEndpointAbility(t, 601, "openrouter-native-messages-toggle")
+
+	initial := pricingEndpointTypesByModel(t)
+	assert.Contains(t, initial["openrouter-native-messages-toggle"], constant.EndpointTypeAnthropic)
+
+	channel, err := GetChannelById(601, true)
+	require.NoError(t, err)
+	channel.SetOtherSettings(dto.ChannelOtherSettings{})
+	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).Update("settings", channel.OtherSettings).Error)
+	CacheUpdateChannel(channel)
+
+	updated := pricingEndpointTypesFromPricing(GetPricing())
+	assert.Equal(t, []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+	}, updated["openrouter-native-messages-toggle"])
+}
+
+func TestPricingOpenRouterEndpointTypesDatabaseMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		dsnEnv       string
+		databaseType common.DatabaseType
+	}{
+		{name: "sqlite", databaseType: common.DatabaseTypeSQLite},
+		{name: "mysql", dsnEnv: "TEST_MYSQL_DSN", databaseType: common.DatabaseTypeMySQL},
+		{name: "postgres", dsnEnv: "TEST_POSTGRES_DSN", databaseType: common.DatabaseTypePostgreSQL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dialector gorm.Dialector
+			switch tc.databaseType {
+			case common.DatabaseTypeSQLite:
+				dialector = sqlite.Open(filepath.Join(t.TempDir(), "pricing.db"))
+			case common.DatabaseTypeMySQL:
+				dsn := os.Getenv(tc.dsnEnv)
+				if dsn == "" {
+					t.Skipf("%s is not configured", tc.dsnEnv)
+				}
+				dialector = mysql.Open(dsn)
+			case common.DatabaseTypePostgreSQL:
+				dsn := os.Getenv(tc.dsnEnv)
+				if dsn == "" {
+					t.Skipf("%s is not configured", tc.dsnEnv)
+				}
+				dialector = postgres.Open(dsn)
+			}
+
+			db, err := gorm.Open(dialector, &gorm.Config{})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+
+			previousDB, previousLogDB := DB, LOG_DB
+			previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			previousMemoryCacheEnabled := common.MemoryCacheEnabled
+			DB, LOG_DB = db, db
+			common.SetDatabaseTypes(tc.databaseType, tc.databaseType)
+			initCol()
+			t.Cleanup(func() {
+				DB, LOG_DB = previousDB, previousLogDB
+				common.SetDatabaseTypes(previousMainType, previousLogType)
+				common.MemoryCacheEnabled = previousMemoryCacheEnabled
+				initCol()
+				InitChannelCache()
+				InvalidatePricingCache()
+				require.NoError(t, sqlDB.Close())
+			})
+
+			versionQuery := "SELECT version()"
+			if tc.databaseType == common.DatabaseTypeSQLite {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("database version: %s", version)
+
+			t.Run("capabilities", TestPricingOpenRouterEndpointTypesFollowChannelSettings)
+			t.Run("settings invalidation", TestPricingOpenRouterNativeMessagesSettingInvalidatesMetadata)
+		})
+	}
 }
 
 func TestInitChannelCacheInvalidatesPricingCache(t *testing.T) {

@@ -19,7 +19,6 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/ai360"
 	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
-	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	//"github.com/QuantumNous/new-api/relay/channel/minimax"
@@ -254,7 +253,8 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
-	if info.ChannelType != constant.ChannelTypeOpenAI && info.ChannelType != constant.ChannelTypeAzure {
+	if info.ChannelType != constant.ChannelTypeOpenAI && info.ChannelType != constant.ChannelTypeAzure &&
+		(info.ChannelType != constant.ChannelTypeOpenRouter || info.ChannelOtherSettings.IsOpenRouterEnterprise()) {
 		request.StreamOptions = nil
 	}
 	// Nested reasoning is an OpenRouter-compatible input dialect and needs
@@ -807,8 +807,6 @@ func (a *Adaptor) GetModelList() []string {
 	//	return minimax.ModelList
 	case constant.ChannelTypeXinference:
 		return xinference.ModelList
-	case constant.ChannelTypeOpenRouter:
-		return openrouter.ModelList
 	default:
 		return ModelList
 	}
@@ -824,8 +822,6 @@ func (a *Adaptor) GetChannelName() string {
 	//	return minimax.ChannelName
 	case constant.ChannelTypeXinference:
 		return xinference.ChannelName
-	case constant.ChannelTypeOpenRouter:
-		return openrouter.ChannelName
 	default:
 		return ChannelName
 	}

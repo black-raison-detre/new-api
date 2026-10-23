@@ -197,6 +197,7 @@ import {
   supportsNewAPIUpstream,
 } from '../../lib/channel-plugin-extensions'
 import { getChannelTypeConfig } from '../../lib/channel-type-config'
+import { resolveOpenRouterModel } from '../../lib/openrouter-routing'
 import {
   collectInvalidStatusCodeEntries,
   collectNewDisallowedStatusCodeRedirects,
@@ -232,6 +233,10 @@ import {
   type ModelMappingDraftRequest,
 } from '../model-mapping-editor'
 import { ModelRedirectPanel } from '../model-redirect-panel'
+import {
+  OpenRouterRoutingBadge,
+  type OpenRouterConnection,
+} from '../openrouter-model-routing-editor'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { UpstreamModelSelection } from '../upstream-model-selection'
 import {
@@ -291,6 +296,9 @@ const SENSITIVE_FORM_FIELDS = [
   'setting',
   'advanced_custom',
   'is_enterprise_account',
+  'openrouter_native_messages',
+  'openrouter_cost_billing',
+  'openrouter_model_routing',
   'vertex_key_type',
   'vertex_project_id',
   'aws_key_type',
@@ -452,6 +460,7 @@ export function ChannelMutateDrawer({
   const channelFormRef = useRef<HTMLFormElement>(null)
   const [modelConfiguration, setModelConfiguration] = useState<{
     pluginKey?: string
+    model?: string
   } | null>(null)
   const [paramOverrideEditorOpen, setParamOverrideEditorOpen] = useState(false)
   const [advancedCustomEditorOpen, setAdvancedCustomEditorOpen] =
@@ -607,6 +616,24 @@ export function ChannelMutateDrawer({
   const currentHeaderOverride = formValues.header_override
   const currentProxy = formValues.proxy
   const currentHttpProtocol = formValues.http_protocol
+  const openRouterConnection = useMemo<OpenRouterConnection>(
+    () => ({
+      type: 20,
+      channel_id: isEditing ? channelId || undefined : undefined,
+      key: currentKey?.trim() || undefined,
+      base_url: currentBaseUrl || '',
+      proxy: currentProxy || '',
+      header_override: currentHeaderOverride || '',
+    }),
+    [
+      isEditing,
+      channelId,
+      currentKey,
+      currentBaseUrl,
+      currentProxy,
+      currentHeaderOverride,
+    ]
+  )
   const {
     unlocked: doubaoApiEditUnlocked,
     handleClick: handleApiConfigSecretClick,
@@ -964,6 +991,16 @@ export function ChannelMutateDrawer({
       ? modelMappingGuardrail.entries.length - 3
       : 0
   const mappingCount = modelMappingGuardrail.entries.length
+  const openRouterMapping = useMemo(
+    () =>
+      Object.fromEntries(
+        modelMappingGuardrail.entries.map((entry) => [
+          entry.source,
+          entry.target,
+        ])
+      ),
+    [modelMappingGuardrail.entries]
+  )
   const upstreamAliases = useMemo(() => {
     const aliases: Record<string, string> = {}
     for (const entry of modelMappingGuardrail.entries) {
@@ -1326,9 +1363,27 @@ export function ChannelMutateDrawer({
   // Handle model selection change from MultiSelect
   const handleModelsChange = useCallback(
     (selected: string[]) => {
-      form.setValue('models', selected.join(','))
+      const previous = parseModelsString(form.getValues('models') || '')
+      const removed = new Set(
+        previous.filter((model) => !selected.includes(model))
+      )
+      if (
+        form.getValues('type') === 20 &&
+        removed.size > 0 &&
+        !sensitiveLocked
+      ) {
+        const routing = form.getValues('openrouter_model_routing') ?? {}
+        form.setValue(
+          'openrouter_model_routing',
+          Object.fromEntries(
+            Object.entries(routing).filter(([model]) => !removed.has(model))
+          ),
+          { shouldDirty: true }
+        )
+      }
+      form.setValue('models', selected.join(','), { shouldDirty: true })
     },
-    [form]
+    [form, sensitiveLocked]
   )
 
   const taskPluginExtensionOptions = useMemo(
@@ -3367,6 +3422,51 @@ export function ChannelMutateDrawer({
                         redirectSourceModels={redirectModelKeyList}
                         onRedirectModel={handleFetchedRedirect}
                         aliases={upstreamAliases}
+                        renderModelAction={
+                          currentType === 20
+                            ? (model) => {
+                                if (!currentModelsArray.includes(model)) {
+                                  return null
+                                }
+                                const upstream = resolveOpenRouterModel(
+                                  model,
+                                  openRouterMapping
+                                )
+                                return (
+                                  <div className='ml-auto flex min-w-0 flex-wrap justify-end gap-1'>
+                                    <OpenRouterRoutingBadge
+                                      policy={
+                                        formValues.openrouter_model_routing?.[
+                                          model
+                                        ]
+                                      }
+                                      upstream={upstream}
+                                    />
+                                    <Button
+                                      type='button'
+                                      variant='ghost'
+                                      size='sm'
+                                      disabled={
+                                        sensitiveLocked ||
+                                        formValues.is_enterprise_account ||
+                                        isSubmitting ||
+                                        upstream === null
+                                      }
+                                      aria-label={t(
+                                        'Configure routing for {{model}}',
+                                        { model }
+                                      )}
+                                      onClick={() =>
+                                        setModelConfiguration({ model })
+                                      }
+                                    >
+                                      {t('Routing')}
+                                    </Button>
+                                  </div>
+                                )
+                              }
+                            : undefined
+                        }
                       />
                       <div className='flex flex-wrap items-center justify-between gap-2'>
                         <p className='text-muted-foreground text-xs'>
@@ -3707,9 +3807,116 @@ export function ChannelMutateDrawer({
                       <Switch
                         disabled={sensitiveLocked}
                         checked={field.value}
+                        onCheckedChange={(checked) => {
+                          field.onChange(checked)
+                          if (checked) {
+                            form.setValue(
+                              'openrouter_model_routing',
+                              {},
+                              { shouldDirty: true }
+                            )
+                          }
+                        }}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            )}
+            {currentType === 20 && (
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Enabling enterprise mode clears per-model routing policies. Model names and mappings are preserved.'
+                )}
+              </p>
+            )}
+
+            {currentType === 20 && (
+              <FormField
+                control={form.control}
+                name='openrouter_native_messages'
+                render={({ field }) => (
+                  <FormItem className='flex items-center justify-between gap-4'>
+                    <div className='space-y-0.5'>
+                      <FormLabel>{t('Native Anthropic Messages')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Forward Messages requests to /v1/messages. Off by default; enterprise accounts keep the existing conversion path.'
+                        )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        disabled={
+                          sensitiveLocked || formValues.is_enterprise_account
+                        }
+                        checked={field.value}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
+                  </FormItem>
+                )}
+              />
+            )}
+
+            {currentType === 20 && (
+              <FormField
+                control={form.control}
+                name='openrouter_cost_billing'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Billing source')}</FormLabel>
+                    <Select
+                      disabled={
+                        sensitiveLocked || formValues.is_enterprise_account
+                      }
+                      items={[
+                        { value: 'local', label: t('Local pricing') },
+                        {
+                          value: 'openrouter',
+                          label: t('OpenRouter returned cost'),
+                        },
+                      ]}
+                      value={
+                        field.value && !formValues.is_enterprise_account
+                          ? 'openrouter'
+                          : 'local'
+                      }
+                      onValueChange={(value) =>
+                        field.onChange(value === 'openrouter')
+                      }
+                    >
+                      <FormControl>
+                        <SelectTrigger className='w-full'>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent alignItemWithTrigger={false}>
+                        <SelectGroup>
+                          <SelectItem value='local'>
+                            {t('Local pricing')}
+                          </SelectItem>
+                          <SelectItem value='openrouter'>
+                            {t('OpenRouter returned cost')}
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FormDescription>
+                      {formValues.is_enterprise_account
+                        ? t('Enterprise accounts use local pricing.')
+                        : t(
+                            'For standard text requests, billing uses the final OpenRouter USD cost multiplied by the effective group multiplier. Funding follows your billing preference; subscription charges stay within their original billing period. Missing costs stay pending; provider-direct BYOK charges are excluded.'
+                          )}
+                      {field.value && !formValues.is_enterprise_account && (
+                        <span className='mt-1 block'>
+                          {t(
+                            'No balance or subscription allowance is reserved upfront. The final charge may exceed the available amount; an exhausted funding source cannot pay for further requests until topped up or reset.'
+                          )}
+                        </span>
+                      )}
+                    </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
@@ -5085,10 +5292,34 @@ export function ChannelMutateDrawer({
           models={currentModelsArray}
           plugins={pluginExtensions}
           initialPluginKey={modelConfiguration.pluginKey}
+          initialModel={modelConfiguration.model}
+          disabled={isSubmitting}
+          openRouter={
+            currentType === 20
+              ? {
+                  modelMapping: currentModelMapping || '',
+                  routing: formValues.openrouter_model_routing ?? {},
+                  connection: openRouterConnection,
+                  enterprise: formValues.is_enterprise_account,
+                  readOnly: sensitiveLocked,
+                }
+              : undefined
+          }
           onOpenChange={(nextOpen) => {
             if (!nextOpen) setModelConfiguration(null)
           }}
-          onApply={handleModelsChange}
+          onApply={(models, openRouter) => {
+            handleModelsChange(models)
+            if (openRouter && !sensitiveLocked) {
+              form.setValue('model_mapping', openRouter.modelMapping, {
+                shouldDirty: true,
+              })
+              form.setValue('openrouter_model_routing', openRouter.routing, {
+                shouldDirty: true,
+                shouldValidate: true,
+              })
+            }
+          }}
           onRedirect={(model) => requestMappingDraft(model, '')}
         />
       )}

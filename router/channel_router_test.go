@@ -53,6 +53,19 @@ func TestChannelStatusRoutesRegisterWithoutConflict(t *testing.T) {
 	})
 }
 
+func TestOpenRouterDiscoveryRequiresSensitivePermission(t *testing.T) {
+	assertChannelRoutePermission(t, http.MethodPost, "/openrouter/catalog", authz.ChannelSensitiveWrite, controller.FetchOpenRouterCatalog)
+	assertChannelRoutePermission(t, http.MethodPost, "/openrouter/endpoints", authz.ChannelSensitiveWrite, controller.FetchOpenRouterEndpoints)
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	registerChannelRoutes(engine.Group("/api"))
+	for _, route := range []string{"/api/channel/openrouter/catalog", "/api/channel/openrouter/endpoints"} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, route, nil))
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	}
+}
+
 func assertChannelRoutePermission(t *testing.T, method string, path string, permission authz.Permission, handler any) {
 	t.Helper()
 	for _, route := range channelPermissionRoutes {

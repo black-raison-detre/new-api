@@ -80,6 +80,9 @@ function ToolSurchargeMarker() {
 
 export function LogCostDisplay(props: LogCostDisplayProps) {
   const { t } = useTranslation()
+  const isOpenRouterCost = props.other?.billing_mode === 'openrouter_cost'
+  const isPending =
+    isOpenRouterCost && props.other?.billing_status !== 'settled'
   const isSubscription = props.other?.billing_source === 'subscription'
   const showToolSurcharge = hasToolSurcharge(props.other)
   const quota = isSubscription
@@ -102,13 +105,17 @@ export function LogCostDisplay(props: LogCostDisplayProps) {
 
   return (
     <TooltipProvider>
-      <div className='inline-flex w-fit items-center gap-1.5'>
+      <div className='inline-flex w-fit flex-wrap items-center gap-1.5'>
         <StatusBadge
           type='badge'
-          variant='neutral'
+          variant={isPending ? 'warning' : 'neutral'}
           size='lg'
           copyable={false}
-          className='border-border/80 bg-muted/60 text-foreground rounded-md border font-semibold tabular-nums'
+          className={
+            isPending
+              ? 'border-warning/40 bg-warning/10 rounded-md border font-semibold'
+              : 'border-border/80 bg-muted/60 text-foreground rounded-md border font-semibold tabular-nums'
+          }
         >
           {source ? (
             <Tooltip>
@@ -132,9 +139,16 @@ export function LogCostDisplay(props: LogCostDisplayProps) {
               <TooltipContent>{source}</TooltipContent>
             </Tooltip>
           ) : null}
-          <span className='whitespace-nowrap'>{formatLogQuota(quota)}</span>
+          <span className='whitespace-nowrap'>
+            {isPending ? t('Pending billing') : formatLogQuota(quota)}
+          </span>
         </StatusBadge>
-        {showToolSurcharge ? <ToolSurchargeMarker /> : null}
+        {isOpenRouterCost && (
+          <Badge variant='outline'>{t('OpenRouter returned cost')}</Badge>
+        )}
+        {showToolSurcharge && !isOpenRouterCost ? (
+          <ToolSurchargeMarker />
+        ) : null}
       </div>
     </TooltipProvider>
   )

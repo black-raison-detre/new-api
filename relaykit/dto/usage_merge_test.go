@@ -3,6 +3,7 @@ package dto
 import (
 	"testing"
 
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -289,4 +290,27 @@ func TestMergeUsageNonZeroKeepsPositiveValuesAndTakesMaxTotal(t *testing.T) {
 	assert.Equal(t, 10, merged.PromptTokens)
 	assert.Equal(t, 5, merged.CompletionTokens)
 	assert.Equal(t, 20, merged.TotalTokens)
+}
+
+func TestMergeUsageNonZeroPreservesExplicitZeroCost(t *testing.T) {
+	t.Parallel()
+
+	var explicitZero Usage
+	require.NoError(t, kitutil.Unmarshal([]byte(`{"cost":0}`), &explicitZero))
+	require.NotNil(t, explicitZero.Cost)
+	assert.Equal(t, float64(0), explicitZero.Cost)
+	merged := MergeUsageNonZero(&Usage{Cost: 0.25}, &explicitZero)
+	assert.Equal(t, float64(0), merged.Cost)
+
+	var nullCost Usage
+	require.NoError(t, kitutil.Unmarshal([]byte(`{"cost":null}`), &nullCost))
+	assert.Nil(t, nullCost.Cost)
+	missing := MergeUsageNonZero(&Usage{Cost: 0.25}, &Usage{})
+	assert.Equal(t, 0.25, missing.Cost)
+
+	invalid := MergeUsageNonZero(&Usage{Cost: 0.25}, &Usage{Cost: "invalid"})
+	assert.Equal(t, "invalid", invalid.Cost)
+
+	claude := MergeClaudeUsageNonZero(&ClaudeUsage{Cost: 0.25}, &ClaudeUsage{Cost: float64(0)})
+	assert.Equal(t, float64(0), claude.Cost)
 }

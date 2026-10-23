@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -429,6 +430,121 @@ func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
 	require.NotContains(t, ids, "zz-token-tiered-empty-expr-model")
 	require.NotContains(t, ids, "zz-token-tiered-missing-expr-model")
 	require.NotContains(t, ids, "zz-token-unpriced-model")
+}
+
+func TestReturnedCostModelDiscoveryDatabaseMatrix(t *testing.T) {
+	withSelfUseModeDisabled(t)
+	originalGroups := setting.UserUsableGroups2JSONString()
+	originalRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","vip":"VIP"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"vip":1}`))
+	t.Cleanup(func() {
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(originalGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalRatios))
+	})
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip("set " + dialect.env + " to run this database")
+			}
+			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			const costSettings = `{"openrouter_cost_billing":true}`
+			fixtures := []struct {
+				name, modelName, group, settings, key string
+				channelType, status                   int
+				multi                                 model.ChannelInfo
+				disabledAbility                       bool
+			}{
+				{name: "cost", modelName: "zz-cost-only", group: "default,vip", settings: costSettings, key: "secret-fixture-key"},
+				{name: "mixed-cost", modelName: "zz-cost-mixed", settings: costSettings, key: "fixture"},
+				{name: "mixed-local", modelName: "zz-cost-mixed", channelType: constant.ChannelTypeOpenAI, key: "fixture"},
+				{name: "cross-cost", modelName: "zz-cost-cross-group", settings: costSettings, key: "fixture"},
+				{name: "cross-local", modelName: "zz-cost-cross-group", group: "vip", channelType: constant.ChannelTypeOpenAI, key: "fixture"},
+				{name: "vip-only", modelName: "zz-cost-vip", group: "vip", settings: costSettings, key: "fixture"},
+				{name: "local", modelName: "zz-cost-local", channelType: constant.ChannelTypeOpenAI, key: "fixture"},
+				{name: "priced-local", modelName: "zz-cost-priced-local", channelType: constant.ChannelTypeOpenAI, key: "fixture"},
+				{name: "enterprise", modelName: "zz-cost-enterprise", settings: `{"openrouter_cost_billing":true,"openrouter_enterprise":true}`, key: "fixture"},
+				{name: "unset", modelName: "zz-cost-unset", settings: `{}`, key: "fixture"},
+				{name: "invalid", modelName: "zz-cost-invalid", settings: `{invalid`, key: "fixture"},
+				{name: "no-key", modelName: "zz-cost-no-key", settings: costSettings},
+				{name: "disabled", modelName: "zz-cost-disabled", settings: costSettings, key: "fixture", status: common.ChannelStatusManuallyDisabled},
+				{name: "disabled-ability", modelName: "zz-cost-disabled-ability", settings: costSettings, key: "fixture", disabledAbility: true},
+				{name: "multi-disabled", modelName: "zz-cost-multi-disabled", settings: costSettings, key: "disabled-key", multi: model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}},
+				{name: "multi-enabled", modelName: "zz-cost-multi-enabled", settings: costSettings, key: "disabled-key\nenabled-key", multi: model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}, MultiKeyPollingIndex: 1, MultiKeyMode: constant.MultiKeyModePolling}},
+				{name: "modifier", modelName: "zz-cost-only@variant", settings: costSettings, key: "fixture"},
+				{name: "fallback-cost", modelName: "zz-cost-base@thinking:on", settings: costSettings, key: "fixture"},
+				{name: "fallback-local", modelName: "zz-cost-base", group: "vip", channelType: constant.ChannelTypeOpenAI, key: "fixture"},
+			}
+			channels := make(map[string]*model.Channel)
+			for _, fixture := range fixtures {
+				channel := &model.Channel{Name: fixture.name, Models: fixture.modelName, Group: fixture.group,
+					Type: fixture.channelType, Status: fixture.status, Key: fixture.key, OtherSettings: fixture.settings, ChannelInfo: fixture.multi}
+				if channel.Type == 0 {
+					channel.Type = constant.ChannelTypeOpenRouter
+				}
+				if channel.Status == 0 {
+					channel.Status = common.ChannelStatusEnabled
+				}
+				if channel.Group == "" {
+					channel.Group = "default"
+				}
+				require.NoError(t, db.Create(channel).Error)
+				for group := range strings.SplitSeq(channel.Group, ",") {
+					require.NoError(t, db.Create(&model.Ability{Group: group, Model: fixture.modelName, ChannelId: channel.Id, Enabled: !fixture.disabledAbility && channel.Status == common.ChannelStatusEnabled}).Error)
+				}
+				channels[fixture.name] = channel
+			}
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"zz-cost-priced-local":0}`))
+			for _, cached := range []bool{false, true} {
+				t.Run(fmt.Sprintf("cache_%t", cached), func(t *testing.T) {
+					common.MemoryCacheEnabled = cached
+					model.InitChannelCache()
+					recorder := httptest.NewRecorder()
+					ctx, _ := gin.CreateTestContext(recorder)
+					ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+					common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+					ListModels(ctx, constant.ChannelTypeOpenAI)
+					assert.Equal(t, map[string]struct{}{
+						"zz-cost-only": {}, "zz-cost-only@variant": {}, "zz-cost-cross-group": {},
+						"zz-cost-multi-enabled": {}, "zz-cost-priced-local": {},
+						"zz-cost-base@thinking:on": {},
+					}, decodeListModelsResponse(t, recorder))
+					tokenRecorder := httptest.NewRecorder()
+					tokenCtx, _ := gin.CreateTestContext(tokenRecorder)
+					tokenCtx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+					common.SetContextKey(tokenCtx, constant.ContextKeyUserGroup, "default")
+					common.SetContextKey(tokenCtx, constant.ContextKeyTokenGroup, "auto")
+					common.SetContextKey(tokenCtx, constant.ContextKeyTokenAutoGroups, []string{"default", "vip"})
+					common.SetContextKey(tokenCtx, constant.ContextKeyTokenModelLimitEnabled, true)
+					common.SetContextKey(tokenCtx, constant.ContextKeyTokenModelLimit, map[string]bool{"zz-cost-only": true, "zz-cost-only@variant": true, "zz-cost-cross-group": true, "zz-cost-mixed": true, "zz-cost-base": true})
+					ListModels(tokenCtx, constant.ChannelTypeOpenAI)
+					assert.Equal(t, map[string]struct{}{"zz-cost-only": {}, "zz-cost-only@variant": {}}, decodeListModelsResponse(t, tokenRecorder))
+					// Discovery must track source changes without writing prices or rotating keys.
+					channel := channels["cost"]
+					channel.OtherSettings = `{}`
+					require.NoError(t, db.Model(channel).Update("settings", channel.OtherSettings).Error)
+					model.CacheUpdateChannel(channel)
+					eligible, err := model.GetOpenRouterCostOnlyModels([]string{"default"})
+					require.NoError(t, err)
+					assert.False(t, eligible["zz-cost-only"])
+					channel.OtherSettings = costSettings
+					require.NoError(t, db.Model(channel).Update("settings", channel.OtherSettings).Error)
+					model.CacheUpdateChannel(channel)
+					var reloaded model.Channel
+					require.NoError(t, db.First(&reloaded, channels["multi-enabled"].Id).Error)
+					assert.Equal(t, 1, reloaded.ChannelInfo.MultiKeyPollingIndex)
+					assert.False(t, helper.HasModelBillingConfig("zz-cost-only"))
+				})
+			}
+			metadata := &model.Model{ModelName: "zz-cost-only"}
+			require.NoError(t, enrichModels([]*model.Model{metadata}))
+			assert.Equal(t, []model.BoundChannel{{Name: "cost", Type: constant.ChannelTypeOpenRouter, BillingSource: model.ChannelBillingSourceOpenRouterCost, Groups: []string{"default", "vip"}}}, metadata.BoundChannels)
+			encoded, err := common.Marshal(metadata)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "secret-fixture-key")
+			assert.NotContains(t, string(encoded), "openrouter_cost_billing")
+		})
+	}
 }
 
 func TestListModelsTokenLimitUsesResolvedCustomAutoGroups(t *testing.T) {

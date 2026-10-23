@@ -6,20 +6,27 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/model"
 	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestPrepareResponsesRequestRetainsConvertedAdaptor(t *testing.T) {
@@ -73,6 +80,176 @@ func TestPrepareResponsesRequestRetainsConvertedAdaptor(t *testing.T) {
 	require.Len(t, upstreamRequest.Messages, 1)
 	assert.Equal(t, "hello", upstreamRequest.Messages[0].StringContent())
 	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatOpenAIResponses, relaytypes.RelayFormatOpenAI}, info.RequestConversionChain)
+}
+
+func TestOpenRouterTextHelperRoutingSurvivesChatToResponsesConversion(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	service.InitHttpClient()
+	global := model_setting.GetGlobalSettings()
+	previous := *global
+	t.Cleanup(func() { *global = previous })
+	global.PassThroughRequestEnabled = false
+	global.ChatCompletionsToResponsesPolicy = model_setting.ChatCompletionsToResponsesPolicy{
+		Enabled: true, AllChannels: true, ModelPatterns: []string{".*"},
+	}
+
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "JSON", true: "stream request"}[stream], func(t *testing.T) {
+			var gotPath string
+			var gotBody map[string]any
+			var gotHeader http.Header
+			var bodyReadErr error
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotHeader = r.Header.Clone()
+				bodyReadErr = common.DecodeJson(r.Body, &gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"limited"}}`))
+			}))
+			defer server.Close()
+
+			originalBody := `{"model":"alias","session_id":"caller-conversation","stream":` + map[bool]string{false: "false", true: "true"}[stream] + `,"messages":[{"role":"user","content":"hello"}]}`
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(originalBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenRouter)
+			common.SetContextKey(c, constant.ContextKeyChannelId, 881)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, "channel-key")
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "alias")
+			common.SetContextKey(c, constant.ContextKeyUserId, 42)
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+			common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{
+				OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+					"alias": {Mode: dto.OpenRouterModelRoutingFloor},
+				},
+			})
+			c.Set("model_mapping", `{"alias":"vendor/model:free:nitro"}`)
+			var request dto.GeneralOpenAIRequest
+			require.NoError(t, common.UnmarshalJsonStr(originalBody, &request))
+			info := relaycommon.GenRelayInfoOpenAI(c, &request)
+
+			apiErr := TextHelper(c, info)
+			require.NoError(t, bodyReadErr)
+			require.NotNil(t, apiErr, "upstream 429 should stop before quota settlement")
+			assert.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
+			assert.Equal(t, "/v1/responses", gotPath)
+			assert.Equal(t, "vendor/model:free:floor", gotBody["model"])
+			assert.Equal(t, stream, gotBody["stream"])
+			sessionID, ok := gotBody["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, sessionID, gotHeader.Get("x-session-id"))
+			assert.NotContains(t, sessionID, "caller-conversation")
+		})
+	}
+}
+
+func TestConvertedOpenRouterResponsesRecordsOnlySuccessfulAffinity(t *testing.T) {
+	service.InitHttpClient()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousStreamingTimeout })
+	originalDB := model.DB
+	originalMemoryCache := common.MemoryCacheEnabled
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}))
+	model.DB = db
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		model.DB = originalDB
+		common.MemoryCacheEnabled = originalMemoryCache
+		sqlDB, dbErr := db.DB()
+		require.NoError(t, dbErr)
+		require.NoError(t, sqlDB.Close())
+	})
+
+	channel := &model.Channel{
+		Type: constant.ChannelTypeOpenRouter, Key: "channel-key", Name: "converted-responses",
+		Status: common.ChannelStatusEnabled, Group: "default", Models: "alias",
+		BaseURL: common.GetPointer(""),
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{OpenRouterModelRouting: map[string]dto.OpenRouterModelRoutingPolicy{
+		"alias": {Mode: dto.OpenRouterModelRoutingFloor},
+	}})
+	require.NoError(t, db.Create(channel).Error)
+
+	for _, tc := range []struct {
+		name     string
+		stream   bool
+		complete bool
+	}{
+		{name: "JSON response records", complete: true},
+		{name: "completed SSE records", stream: true, complete: true},
+		{name: "unterminated SSE does not record", stream: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			var gotBody map[string]any
+			var gotHeader http.Header
+			var bodyReadErr error
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotHeader = r.Header.Clone()
+				bodyReadErr = common.DecodeJson(r.Body, &gotBody)
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_1","model":"vendor/model:free:floor"}}`+"\n\n")
+					if tc.complete {
+						_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"vendor/model:free:floor","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`+"\n\ndata: [DONE]\n\n")
+					}
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"vendor/model:free:floor","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+			}))
+			defer server.Close()
+
+			sessionID := "caller-" + strings.ReplaceAll(t.Name(), "/", "-")
+			originalBody := `{"model":"alias","session_id":"` + sessionID + `","messages":[{"role":"user","content":"hello"}]}`
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(originalBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyUserId, 711)
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+			common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
+			c.Set("original_model", "alias")
+
+			stream := tc.stream
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "alias",
+				RelayFormat:     relaytypes.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions,
+				RequestURLPath: "/v1/chat/completions", UserId: 711, UsingGroup: "default", IsStream: stream,
+				ShouldIncludeUsage: true,
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType: constant.ChannelTypeOpenRouter, ChannelId: channel.Id, ChannelBaseUrl: server.URL, ApiKey: channel.Key,
+					UpstreamModelName:    "vendor/model:free:nitro",
+					ChannelOtherSettings: channel.GetOtherSettings(),
+				},
+			}
+			adaptor := GetAdaptor(constant.APITypeOpenRouter)
+			adaptor.Init(info)
+			responseReq := &dto.OpenAIResponsesRequest{Model: "alias", Input: json.RawMessage(`"hello"`), Stream: &stream}
+			usage, apiErr := relayResponsesRequest(c, info, adaptor, responseReq, false)
+			require.NoError(t, bodyReadErr)
+			if apiErr != nil {
+				t.Fatalf("converted Responses request failed: %v", apiErr)
+			}
+			require.NotNil(t, usage)
+			assert.Equal(t, "/v1/responses", gotPath)
+			assert.Equal(t, "vendor/model:free:floor", gotBody["model"])
+			outboundSession, ok := gotBody["session_id"].(string)
+			require.True(t, ok)
+			assert.Equal(t, outboundSession, gotHeader.Get("x-session-id"))
+			assert.NotContains(t, outboundSession, sessionID)
+
+			_, _, bound := service.OpenRouterSessionCredential(c, channel)
+			assert.Equal(t, tc.complete, bound)
+		})
+	}
 }
 
 func TestIsResponsesEventStreamContentType(t *testing.T) {

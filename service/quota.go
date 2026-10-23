@@ -86,6 +86,9 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 }
 
 func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.RealtimeUsage) error {
+	if relayInfo.OpenRouterCostBillingConfigured() {
+		return errors.New(openRouterCostMessage(ctx, i18n.MsgRelayOpenRouterCostUnsupported))
+	}
 	if relayInfo.UsePrice {
 		return nil
 	}

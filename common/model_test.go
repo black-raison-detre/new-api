@@ -36,3 +36,10 @@ func TestDeepSeekToolRoutingNamesReportTheirEndpoint(t *testing.T) {
 	}
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAI}, common.GetEndpointTypesByChannelType(constant.ChannelTypeDeepSeek, "deepseek-flash"))
 }
+
+func TestOpenRouterReportsChatAndResponsesEndpoints(t *testing.T) {
+	assert.Equal(t, []constant.EndpointType{
+		constant.EndpointTypeOpenAI,
+		constant.EndpointTypeOpenAIResponse,
+	}, common.GetEndpointTypesByChannelType(constant.ChannelTypeOpenRouter, "openrouter-model"))
+}

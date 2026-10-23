@@ -279,6 +279,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if streamResp.Response != nil {
 			info.ObserveResponseModel(streamResp.Response.Model)
 		}
+		if info.OpenRouterSessionAffinityEnabled {
+			service.ObserveResponsesOutcome(info, &streamResp)
+		}
 		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
 			upstreamFailed = true
 			if streamResp.Response != nil {

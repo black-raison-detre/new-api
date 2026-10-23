@@ -1017,6 +1017,17 @@ func (channel *Channel) ValidateSettings() error {
 	if err := channelOtherSettings.ValidateToolLossPolicy(); err != nil {
 		return err
 	}
+	if err := channelOtherSettings.ValidateOpenRouterModelRouting(); err != nil {
+		return err
+	}
+	if len(channelOtherSettings.OpenRouterModelRouting) > 0 {
+		if channel.Type != constant.ChannelTypeOpenRouter {
+			return fmt.Errorf("openrouter_model_routing is only valid for OpenRouter channels")
+		}
+		if channelOtherSettings.IsOpenRouterEnterprise() {
+			return fmt.Errorf("openrouter_model_routing is not supported on enterprise channels")
+		}
+	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {
 		channelOtherSettings.AdvancedCustom = preset
 	}
@@ -1066,8 +1077,12 @@ func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
 		if err != nil {
 			common.SysLog(common.LogText("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
+			if channel.Type == constant.ChannelTypeOpenRouter && strings.Contains(channel.OtherSettings, `"openrouter_model_routing"`) {
+				setting.OpenRouterModelRoutingInvalid = true
+			} else {
+				channel.OtherSettings = "{}" // 清空设置以避免后续错误
+				_ = channel.Save()           // 保存修改
+			}
 		}
 	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {

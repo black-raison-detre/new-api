@@ -640,11 +640,14 @@ func (c *ClaudeResponse) GetClaudeError() *types.ClaudeError {
 }
 
 type ClaudeUsage struct {
-	InputTokens              int                       `json:"input_tokens"`
-	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int                       `json:"cache_read_input_tokens"`
-	OutputTokens             int                       `json:"output_tokens"`
-	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	// Cost preserves the optional provider-reported cost extension; a non-nil
+	// zero is explicit, while nil means it was not reported.
+	Cost          any                       `json:"cost,omitempty"`
+	CacheCreation *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
 	// claude cache 1h
 	ClaudeCacheCreation5mTokens int                  `json:"claude_cache_creation_5_m_tokens"`
 	ClaudeCacheCreation1hTokens int                  `json:"claude_cache_creation_1_h_tokens"`

@@ -61,6 +61,9 @@ func buildOpenAIStyleUsageFromClaudeUsage(usage *dto.Usage) dto.Usage {
 	if mapped == nil {
 		return dto.Usage{}
 	}
+	if usage != nil {
+		mapped.Cost = usage.Cost
+	}
 	return *mapped
 }
 
@@ -83,7 +86,24 @@ func patchClaudeMessageDeltaUsageData(data string, usage *dto.ClaudeUsage) strin
 }
 
 func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *dto.ChatCompletionsStreamResponse, claudeInfo *ClaudeResponseInfo) bool {
-	return relayconvert.FormatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo)
+	shouldContinue := relayconvert.FormatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo)
+	if claudeResponse == nil || claudeInfo == nil {
+		return shouldContinue
+	}
+	usage := claudeResponse.Usage
+	if usage == nil && claudeResponse.Message != nil {
+		usage = claudeResponse.Message.Usage
+	}
+	if usage != nil && usage.Cost != nil {
+		if claudeInfo.Usage == nil {
+			claudeInfo.Usage = &dto.Usage{}
+		}
+		claudeInfo.Usage.Cost = usage.Cost
+		if oaiResponse != nil && oaiResponse.Usage != nil {
+			oaiResponse.Usage.Cost = usage.Cost
+		}
+	}
+	return shouldContinue
 }
 
 func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
@@ -110,6 +130,12 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	}
 	if info.RelayFormat == types.RelayFormatClaude {
 		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
+		if info.GetChannelType() == constant.ChannelTypeOpenRouter &&
+			claudeResponse.Type == "message_delta" &&
+			claudeResponse.Usage != nil &&
+			claudeResponse.Usage.Cost != nil {
+			info.OpenRouterCostFinal = true
+		}
 
 		if claudeResponse.Type == "message_start" {
 			// message_start, 获取usage
@@ -373,6 +399,10 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.PromptTokens = claudeResponse.Usage.InputTokens
 		claudeInfo.Usage.CompletionTokens = claudeResponse.Usage.OutputTokens
 		claudeInfo.Usage.TotalTokens = claudeResponse.Usage.InputTokens + claudeResponse.Usage.OutputTokens
+		claudeInfo.Usage.Cost = claudeResponse.Usage.Cost
+		if !info.IsStream && info.GetChannelType() == constant.ChannelTypeOpenRouter && claudeResponse.Usage.Cost != nil {
+			info.OpenRouterCostFinal = true
+		}
 		claudeInfo.Usage.UsageSemantic = "anthropic"
 		claudeInfo.Usage.BillingUsage = dto.CloneBillingUsage(claudeResponse.Usage.BillingUsage)
 		if claudeInfo.Usage.BillingUsage == nil {

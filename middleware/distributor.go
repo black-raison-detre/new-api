@@ -619,9 +619,13 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
+	key, index, bound := service.OpenRouterSessionCredential(c, channel)
+	if !bound {
+		var newAPIError *types.NewAPIError
+		key, index, newAPIError = channel.GetNextEnabledKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
